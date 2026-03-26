@@ -468,7 +468,10 @@ class S2ProSGLangModelRunner:
                 continue
 
             # [num_codebooks+1] → [num_codebooks+1, 1] for existing format
-            codes = text_model._output_codes[i].unsqueeze(-1)
+            # .clone() is critical: _output_codes is a persistent GPU buffer
+            # overwritten every decode step. Without clone, the view aliases
+            # stale data by the time the stream builder vocodes it.
+            codes = text_model._output_codes[i].clone().unsqueeze(-1)
             outputs[sched_req.request_id] = RequestOutput(
                 request_id=sched_req.request_id,
                 data=S2ProStepOutput(codes=codes),
