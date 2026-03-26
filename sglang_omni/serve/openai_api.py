@@ -424,6 +424,18 @@ def _register_speech(app: FastAPI) -> None:
         request_id = f"speech-{uuid.uuid4()}"
 
         gen_req = _build_speech_generate_request(req, default_model)
+        if req.stream and req.chunked_input and req.voice_id:
+            return StreamingResponse(
+                _speech_stream_chunked(
+                    client=client,
+                    req=req,
+                    default_model=default_model,
+                    base_request_id=request_id,
+                    response_format=req.response_format,
+                    speed=req.speed,
+                ),
+                media_type="text/event-stream",
+            )
         if req.stream:
             return StreamingResponse(
                 _speech_stream(
@@ -528,6 +540,141 @@ async def _speech_stream(
 
     final_payload = {
         "id": f"speech-{request_id}",
+        "object": "audio.speech.chunk",
+        "index": chunk_index,
+        "audio": None,
+        "finish_reason": finish_reason or "stop",
+        "usage": usage,
+    }
+    yield f"data: {json.dumps(final_payload)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+import re
+
+_SENTENCE_SPLIT_RE = re.compile(
+    r'(?<=[.!?])\s+|(?<=[.!?])(?=[A-Z"])|(?<=\.\.\.)\s*'
+)
+
+
+def _split_text_into_chunks(text: str, sentences_per_chunk: int = 2) -> list[str]:
+    """Split text into chunks of N sentences for incremental TTS.
+
+    Preserves punctuation and whitespace. Falls back to the full text
+    if no sentence boundaries are found.
+    """
+    sentences = _SENTENCE_SPLIT_RE.split(text.strip())
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return [text]
+
+    chunks = []
+    for i in range(0, len(sentences), sentences_per_chunk):
+        chunk = " ".join(sentences[i : i + sentences_per_chunk])
+        if chunk:
+            chunks.append(chunk)
+    return chunks or [text]
+
+
+async def _speech_stream_chunked(
+    client: Client,
+    req: CreateSpeechRequest,
+    default_model: str,
+    base_request_id: str,
+    response_format: str,
+    speed: float,
+):
+    """Stream audio by splitting input into sentence chunks.
+
+    Each chunk is a separate TTS request sharing the same voice_id prefix
+    in the RadixCache. This gives low TTFA because each chunk's prefill
+    is only the short sentence text (~15-30 tokens), not the full input.
+
+    Pipeline: while chunk N streams audio, chunk N+1 is already prefilling.
+    """
+    chunks = _split_text_into_chunks(req.input, req.chunk_sentences)
+    logger.info(
+        "Chunked input: %d chunks from %d chars (sentences_per_chunk=%d)",
+        len(chunks), len(req.input), req.chunk_sentences,
+    )
+
+    chunk_index = 0
+    finish_reason: str | None = None
+    usage: dict | None = None
+
+    try:
+        for ci, chunk_text in enumerate(chunks):
+            chunk_req_id = f"{base_request_id}-c{ci}"
+            is_last = ci == len(chunks) - 1
+
+            # Build a per-chunk generate request (same voice_id, different text)
+            chunk_speech_req = CreateSpeechRequest(
+                model=req.model,
+                input=chunk_text,
+                voice=req.voice,
+                response_format=req.response_format,
+                speed=req.speed,
+                stream=True,
+                voice_id=req.voice_id,
+                temperature=req.temperature,
+                top_p=req.top_p,
+                top_k=req.top_k,
+                repetition_penalty=req.repetition_penalty,
+                max_new_tokens=req.max_new_tokens,
+            )
+            gen_req = _build_speech_generate_request(chunk_speech_req, default_model)
+
+            emitted_samples = 0
+            async for chunk in client.generate(gen_req, request_id=chunk_req_id):
+                if chunk.finish_reason is not None:
+                    if is_last:
+                        finish_reason = chunk.finish_reason
+                    if chunk.usage is not None and is_last:
+                        usage = chunk.usage.to_dict()
+
+                if chunk.audio_data is None:
+                    continue
+
+                sample_rate = chunk.sample_rate or DEFAULT_SAMPLE_RATE
+                audio_data, emitted_samples = _select_speech_audio_delta(
+                    chunk.audio_data,
+                    emitted_samples=emitted_samples,
+                    is_terminal=chunk.finish_reason is not None,
+                )
+                if audio_data is None:
+                    continue
+
+                audio_bytes, mime_type = encode_audio(
+                    audio_data,
+                    response_format=response_format,
+                    sample_rate=sample_rate,
+                    speed=speed,
+                )
+                actual_format = MIME_TO_FORMAT.get(mime_type, response_format)
+                payload = {
+                    "id": f"speech-{base_request_id}",
+                    "object": "audio.speech.chunk",
+                    "index": chunk_index,
+                    "chunk_part": ci,
+                    "audio": {
+                        "data": base64.b64encode(audio_bytes).decode("ascii"),
+                        "format": actual_format,
+                        "mime_type": mime_type,
+                        "sample_rate": sample_rate,
+                    },
+                    "finish_reason": None,
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+                chunk_index += 1
+
+    except ClientError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Error in chunked speech stream for %s", base_request_id)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    final_payload = {
+        "id": f"speech-{base_request_id}",
         "object": "audio.speech.chunk",
         "index": chunk_index,
         "audio": None,
