@@ -90,6 +90,7 @@ def create_app(
     _register_models(app)
     _register_chat_completions(app)
     _register_speech(app)
+    _register_voice_cache(app)
 
     return app
 
@@ -560,6 +561,77 @@ def _select_speech_audio_delta(
     return audio[emitted_samples:], total_samples
 
 
+def _register_voice_cache(app: FastAPI) -> None:
+    from sglang_omni.models.fishaudio_s2_pro.pipeline.stages import (
+        delete_cached_voice,
+        list_cached_voices,
+    )
+
+    @app.get("/v1/voices")
+    async def list_voices() -> JSONResponse:
+        """List all cached voice IDs."""
+        voices = list_cached_voices()
+        return JSONResponse(content={"voices": voices, "count": len(voices)})
+
+    @app.delete("/v1/voices/{voice_id}")
+    async def delete_voice(voice_id: str) -> JSONResponse:
+        """Delete a cached voice by ID."""
+        deleted = delete_cached_voice(voice_id)
+        if not deleted:
+            raise HTTPException(
+                status_code=404, detail=f"Voice '{voice_id}' not found in cache"
+            )
+        return JSONResponse(content={"deleted": True, "voice_id": voice_id})
+
+    @app.post("/v1/voices/{voice_id}/warmup")
+    async def warmup_voice(voice_id: str) -> JSONResponse:
+        """Warm up a cached voice by sending a minimal TTS request.
+
+        This populates the SGLang RadixCache with the voice prefix KV states
+        so subsequent concurrent requests get prefix cache hits and batch
+        into a single GPU forward pass.
+        """
+        from sglang_omni.models.fishaudio_s2_pro.pipeline.stages import (
+            get_cached_voice,
+        )
+
+        cached = get_cached_voice(voice_id)
+        if cached is None:
+            raise HTTPException(
+                status_code=404, detail=f"Voice '{voice_id}' not found in cache"
+            )
+
+        client: Client = app.state.client
+        default_model: str = app.state.model_name
+        request_id = f"warmup-{voice_id}-{uuid.uuid4().hex[:8]}"
+
+        # Send a minimal streaming request with the voice_id to prefill
+        # the voice prefix and populate the RadixCache.
+        gen_req = GenerateRequest(
+            model=default_model,
+            prompt={"text": ".", "voice_id": voice_id},
+            sampling=SamplingParams(
+                temperature=0.8, top_p=0.8, top_k=30, max_new_tokens=1,
+            ),
+            stream=True,
+            output_modalities=["audio"],
+            metadata={"task": "tts"},
+        )
+
+        try:
+            # Let the request complete fully (max_new_tokens=1) so the
+            # RadixCache persists the voice prefix KV states.
+            async for chunk in client.generate(gen_req, request_id=request_id):
+                pass  # consume all chunks until completion
+        except Exception:
+            pass  # Warmup failure is non-fatal
+
+        return JSONResponse(content={
+            "voice_id": voice_id,
+            "warmed_up": True,
+        })
+
+
 def _build_speech_generate_request(
     req: CreateSpeechRequest,
     default_model: str,
@@ -617,6 +689,11 @@ def _build_speech_generate_request(
 
     if references:
         prompt = {"text": req.input, "references": references}
+        if req.voice_id is not None:
+            prompt["voice_id"] = req.voice_id
+    elif req.voice_id is not None:
+        # voice_id without new references — use cached voice
+        prompt = {"text": req.input, "voice_id": req.voice_id}
 
     return GenerateRequest(
         model=req.model or default_model,

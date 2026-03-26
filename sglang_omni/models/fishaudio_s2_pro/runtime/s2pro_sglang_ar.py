@@ -338,6 +338,9 @@ class S2ProSGLangIterationController:
         if data.req.is_chunked > 0:
             return False
 
+        if output.data is None:
+            return False
+
         semantic_token = output.data.codes[0, -1].item()
         if semantic_token == self._im_end_id:
             return True

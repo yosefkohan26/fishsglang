@@ -7,6 +7,7 @@ import asyncio
 import logging
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Deque, Optional
 
@@ -73,6 +74,7 @@ class OmniEngine(Engine):
         cache_manager: CacheManager | None = None,
         enable_overlap: bool = False,
         feedback_mailbox: StreamQueue | None = None,
+        batch_window_ms: float = 0.0,
     ):
         self.scheduler = scheduler
         self.model_runner = model_runner
@@ -82,6 +84,18 @@ class OmniEngine(Engine):
 
         self._running = False
         self._loop_task: asyncio.Task[None] | None = None
+        # Event to wake the engine loop immediately when new work arrives,
+        # eliminating up to 1ms of idle polling latency.
+        self._work_event: asyncio.Event = asyncio.Event()
+        # Dedicated single-thread executor for GPU model execution to reduce
+        # thread dispatch overhead and avoid GIL contention with default pool.
+        self._gpu_executor: ThreadPoolExecutor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="omni-gpu"
+        )
+        # Batch accumulation window: when the engine is idle and new work
+        # arrives, wait this long before scheduling to let concurrent requests
+        # accumulate.  PrefillAdder then batches them into one GPU forward pass.
+        self._batch_window_s: float = batch_window_ms / 1000.0
 
         # Overlap scheduling state
         self._result_queue: Deque[_PendingResult] = deque()
@@ -94,6 +108,7 @@ class OmniEngine(Engine):
     async def add_request(self, request_id: str, data: Any) -> None:
         """Add a request for processing."""
         self.scheduler.add_request(request_id, data)
+        self._work_event.set()  # Wake engine loop immediately
 
     async def get_result(self, request_id: str) -> Any:
         """Get result for a request (blocks until ready)."""
@@ -170,7 +185,20 @@ class OmniEngine(Engine):
             # Check for arrived feedback even when idle
             if self._feedback_mailbox is not None:
                 self._check_feedback()
-            await asyncio.sleep(0.001)  # Brief sleep when idle
+            # Wait for new work signal instead of fixed-duration polling.
+            # Falls back to 5ms timeout to handle feedback and other events.
+            self._work_event.clear()
+            try:
+                await asyncio.wait_for(self._work_event.wait(), timeout=0.005)
+            except asyncio.TimeoutError:
+                pass
+            # Batch accumulation window: if new work arrived and we have a
+            # batch window configured, wait briefly so concurrent requests
+            # land in the scheduler before the next schedule() call.
+            # PrefillAdder will then batch all waiting requests into one
+            # GPU forward pass instead of processing them one at a time.
+            if self._work_event.is_set() and self._batch_window_s > 0:
+                await asyncio.sleep(self._batch_window_s)
             return False
 
         try:
@@ -195,7 +223,7 @@ class OmniEngine(Engine):
             if execute_in_thread:
                 loop = asyncio.get_running_loop()
                 model_output = await loop.run_in_executor(
-                    None,
+                    self._gpu_executor,
                     self.model_runner.execute,
                     scheduler_output,
                 )
@@ -269,11 +297,18 @@ class OmniEngine(Engine):
             if self._result_queue:
                 self._process_pending_result()
             elif self._feedback_mailbox is not None:
-                # Still check for arrived feedback even when idle
                 self._check_feedback()
-                await asyncio.sleep(0.001)
+                self._work_event.clear()
+                try:
+                    await asyncio.wait_for(self._work_event.wait(), timeout=0.005)
+                except asyncio.TimeoutError:
+                    pass
             else:
-                await asyncio.sleep(0.001)
+                self._work_event.clear()
+                try:
+                    await asyncio.wait_for(self._work_event.wait(), timeout=0.005)
+                except asyncio.TimeoutError:
+                    pass
             self._last_scheduler_output = None
             return False
 

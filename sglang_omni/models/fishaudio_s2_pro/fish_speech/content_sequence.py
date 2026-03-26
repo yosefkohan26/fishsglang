@@ -18,6 +18,26 @@ from sglang_omni.models.fishaudio_s2_pro.fish_speech.tokenizer import (
 )
 
 
+# Cached semantic-code → token-ID lookup table.  Built once per tokenizer,
+# eliminates ~700 string-format + dict-lookup calls per VQ part encode.
+_semantic_lut_cache: dict[int, list[int]] = {}
+
+
+def _get_semantic_lut(tokenizer) -> list[int] | None:
+    """Return a list where lut[code] = token_id for semantic codes 0..4095."""
+    tok_id = id(tokenizer)
+    if tok_id in _semantic_lut_cache:
+        return _semantic_lut_cache[tok_id]
+    try:
+        lut = tokenizer.convert_tokens_to_ids(
+            [SEMANTIC_TOKEN_TEMPLATE.format(i=i) for i in range(4096)]
+        )
+        _semantic_lut_cache[tok_id] = lut
+        return lut
+    except Exception:
+        return None
+
+
 def restore_ndarray(obj, to_tensor: bool = False):
     if isinstance(obj, dict) and "__ndarray__" in obj:
         obj = np.frombuffer(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
@@ -233,15 +253,21 @@ class ContentSequence:
                 tokens = torch.tensor(tokens, dtype=torch.int)
             elif isinstance(part, VQPart):
                 curr_codes = part.codes.clone().to(torch.int)
-                tokens = torch.tensor(
-                    tokenizer.convert_tokens_to_ids(
-                        [
-                            SEMANTIC_TOKEN_TEMPLATE.format(i=i)
-                            for i in curr_codes[0].int()
-                        ]
-                    ),
-                    dtype=torch.int,
-                )
+                # Use cached semantic token ID lookup table for speed.
+                # The first call builds the table; subsequent calls reuse it.
+                sem_codes = curr_codes[0].int().tolist()
+                lut = _get_semantic_lut(tokenizer)
+                if lut is not None and all(0 <= c < len(lut) for c in sem_codes):
+                    tokens = torch.tensor(
+                        [lut[c] for c in sem_codes], dtype=torch.int
+                    )
+                else:
+                    tokens = torch.tensor(
+                        tokenizer.convert_tokens_to_ids(
+                            [SEMANTIC_TOKEN_TEMPLATE.format(i=i) for i in sem_codes]
+                        ),
+                        dtype=torch.int,
+                    )
                 vq_parts.append(curr_codes)
                 vq_require_losses.append(part.cal_loss)
             elif isinstance(part, AudioPart):

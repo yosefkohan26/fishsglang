@@ -75,6 +75,7 @@ def create_s2pro_sglang_engine(
     ras_window: int = 16,
     ras_temperature: float = 1.5,
     ras_top_p: float = 0.95,
+    batch_window_ms: float = 0.0,
 ) -> OmniEngine:
     """Create a unified S2-Pro engine (slow+fast head in one CUDA graph)."""
     from sglang_omni.engines.ar.sglang_backend.model_worker import (
@@ -186,4 +187,8 @@ def create_s2pro_sglang_engine(
         semantic_end_id,
     )
 
-    return OmniEngine(scheduler=scheduler, model_runner=model_runner)
+    return OmniEngine(
+        scheduler=scheduler,
+        model_runner=model_runner,
+        batch_window_ms=batch_window_ms,
+    )

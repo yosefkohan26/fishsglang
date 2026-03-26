@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmark artifacts
+benchmark_audio/
+benchmark_ttfa.py
+output.wav
+
+# Logs
+*.log
+
+# Temporary
+/tmp/
+*.tmp
+
+# HF cache
+.cache/
+
+# Torch compile cache
+__torchcompile__/
+
+# Claude Code helper files
+readallfiles/

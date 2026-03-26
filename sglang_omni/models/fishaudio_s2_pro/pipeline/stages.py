@@ -6,7 +6,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -20,6 +22,7 @@ from sglang_omni.models.fishaudio_s2_pro.pipeline.engine_io import (
 from sglang_omni.models.fishaudio_s2_pro.pipeline.state_io import (
     load_state,
     store_state,
+    strip_live_state,
 )
 from sglang_omni.proto import StagePayload
 
@@ -29,6 +32,46 @@ _STREAM_CODES_KEY = "_stream_output_codes"
 _STREAM_EMITTED_SAMPLES_KEY = "_stream_emitted_samples"
 _STREAM_LAST_VOCODE_TOKENS_KEY = "_stream_last_vocode_tokens"
 _STREAM_NEXT_VOCODE_TOKENS_KEY = "_stream_next_vocode_tokens"
+
+# ---------------------------------------------------------------------------
+# Voice reference cache — keyed by voice_id, stores encoded VQ codes so
+# subsequent requests skip the expensive codec.encode() step entirely.
+# Thread-safe: _preprocess runs in a thread pool, API routes run on the
+# event loop.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _CachedVoice:
+    vq_codes: torch.Tensor  # [num_codebooks, T] on CPU
+    ref_text: str
+    # Pre-built prompt prefix (system + user role header) so build_prompt()
+    # only needs to tokenize the short user text, not re-encode ~700 VQ codes.
+    prompt_prefix: dict | None = None  # {input_ids, vq_mask_tokens, vq_parts} for prefix
+
+
+_voice_cache: dict[str, _CachedVoice] = {}
+_voice_cache_lock = threading.Lock()
+
+
+def get_cached_voice(voice_id: str) -> _CachedVoice | None:
+    with _voice_cache_lock:
+        return _voice_cache.get(voice_id)
+
+
+def put_cached_voice(voice_id: str, vq_codes: torch.Tensor, ref_text: str) -> None:
+    with _voice_cache_lock:
+        _voice_cache[voice_id] = _CachedVoice(vq_codes=vq_codes.cpu(), ref_text=ref_text)
+
+
+def delete_cached_voice(voice_id: str) -> bool:
+    with _voice_cache_lock:
+        return _voice_cache.pop(voice_id, None) is not None
+
+
+def list_cached_voices() -> list[str]:
+    with _voice_cache_lock:
+        return list(_voice_cache.keys())
 
 
 def _resolve_checkpoint(checkpoint: str) -> str:
@@ -220,6 +263,106 @@ def _maybe_build_incremental_audio_chunk(
     return chunk
 
 
+def _build_prompt_from_cached_prefix(
+    adapter: Any,
+    user_text: str,
+    prefix: dict,
+    num_codebooks: int,
+) -> dict:
+    """Build a full prompt by concatenating cached prefix with user text suffix.
+
+    The prefix contains the system message (voice reference VQ codes + text) and
+    the user role header. We only need to tokenize the short user text and the
+    assistant voice marker, then concatenate with the cached prefix tokens.
+
+    This avoids re-tokenizing ~700 VQ semantic tokens on every request.
+    """
+    # Build just the user-text suffix (no references)
+    suffix_data = adapter.build_prompt(
+        text=user_text,
+        references=None,
+        num_codebooks=num_codebooks,
+    )
+
+    # Concatenate prefix + suffix
+    prefix_ids = prefix["input_ids"]
+    suffix_ids = suffix_data["input_ids"]
+
+    if isinstance(prefix_ids, torch.Tensor) and isinstance(suffix_ids, torch.Tensor):
+        combined_ids = torch.cat([prefix_ids, suffix_ids])
+    else:
+        combined_ids = list(prefix_ids) + list(suffix_ids)
+
+    prefix_mask = prefix["vq_mask_tokens"]
+    suffix_mask = suffix_data["vq_mask_tokens"]
+    if isinstance(prefix_mask, torch.Tensor) and isinstance(suffix_mask, torch.Tensor):
+        combined_mask = torch.cat([prefix_mask, suffix_mask])
+    else:
+        combined_mask = list(prefix_mask) + list(suffix_mask)
+
+    combined_vq = list(prefix.get("vq_parts") or []) + list(suffix_data.get("vq_parts") or [])
+
+    return {
+        "input_ids": combined_ids,
+        "vq_mask_tokens": combined_mask,
+        "vq_parts": combined_vq,
+    }
+
+
+def _cache_prompt_prefix(
+    voice_id: str,
+    user_text: str,
+    full_prompt_data: dict,
+    adapter: Any,
+    num_codebooks: int,
+) -> None:
+    """Extract and cache the voice prefix from a full prompt.
+
+    The prefix = full_prompt - user_text_suffix. We build the suffix separately,
+    then subtract its length from the full prompt to get the prefix tokens.
+    """
+    try:
+        suffix_data = adapter.build_prompt(
+            text=user_text,
+            references=None,
+            num_codebooks=num_codebooks,
+        )
+        suffix_len = len(suffix_data["input_ids"])
+        full_ids = full_prompt_data["input_ids"]
+        full_mask = full_prompt_data["vq_mask_tokens"]
+        prefix_len = len(full_ids) - suffix_len
+
+        if prefix_len <= 0:
+            return
+
+        if isinstance(full_ids, torch.Tensor):
+            prefix_ids = full_ids[:prefix_len].clone()
+            prefix_mask = full_mask[:prefix_len].clone()
+        else:
+            prefix_ids = list(full_ids)[:prefix_len]
+            prefix_mask = list(full_mask)[:prefix_len]
+
+        # VQ parts belong entirely to the prefix (voice reference)
+        prefix_vq = list(full_prompt_data.get("vq_parts") or [])
+
+        prefix_dict = {
+            "input_ids": prefix_ids,
+            "vq_mask_tokens": prefix_mask,
+            "vq_parts": prefix_vq,
+        }
+
+        with _voice_cache_lock:
+            cached = _voice_cache.get(voice_id)
+            if cached is not None:
+                cached.prompt_prefix = prefix_dict
+                logger.info(
+                    "Cached prompt prefix for voice_id=%s (%d prefix tokens)",
+                    voice_id, prefix_len,
+                )
+    except Exception as e:
+        logger.warning("Failed to cache prompt prefix for %s: %s", voice_id, e)
+
+
 def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
     checkpoint_dir = _resolve_checkpoint(model_path)
 
@@ -262,11 +405,23 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
         text = inputs.get("text", "")
         num_codebooks = inputs.get("num_codebooks", 10)
         codebook_size = inputs.get("codebook_size", 4096)
+        voice_id = inputs.get("voice_id")
 
         # Build voice-cloning references
         references: list[Reference] | None = None
         raw_refs = inputs.get("references")
-        if raw_refs:
+
+        # Check voice cache first — skip encoding entirely if cached
+        prompt_data = None
+        if voice_id and not raw_refs:
+            cached = get_cached_voice(voice_id)
+            if cached is not None:
+                logger.debug("Voice cache hit for voice_id=%s", voice_id)
+                references = [
+                    Reference(audio_bytes=b"", text=cached.ref_text, vq_codes=cached.vq_codes)
+                ]
+
+        if references is None and raw_refs:
             references = []
             for ref_data in raw_refs:
                 vq_codes = ref_data.get("vq_codes")
@@ -276,19 +431,26 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
                 if vq_codes is None and ref_data.get("audio_path"):
                     vq_codes = _encode_reference_audio(ref_data["audio_path"])
 
+                ref_text = ref_data.get("text", "")
                 references.append(
                     Reference(
                         audio_bytes=b"",
-                        text=ref_data.get("text", ""),
+                        text=ref_text,
                         vq_codes=vq_codes,
                     )
                 )
 
-        prompt_data = adapter.build_prompt(
-            text=text,
-            references=references,
-            num_codebooks=num_codebooks,
-        )
+                # Populate cache on first use when voice_id is provided
+                if voice_id and vq_codes is not None:
+                    put_cached_voice(voice_id, vq_codes, ref_text)
+                    logger.info("Cached voice_id=%s (%d tokens)", voice_id, vq_codes.shape[-1])
+
+        if prompt_data is None:
+            prompt_data = adapter.build_prompt(
+                text=text,
+                references=references,
+                num_codebooks=num_codebooks,
+            )
 
         state = S2ProState(
             input_ids=prompt_data["input_ids"],
@@ -317,6 +479,7 @@ def create_sglang_tts_engine_executor(
     stream_followup_stride: int = 50,
     stream_left_context: int = 25,
     stream_vocoder_device: str | None = None,
+    batch_window_ms: float = 0.0,
 ) -> EngineExecutor:
     """Factory for the S2-Pro TTS engine stage."""
     from sglang.srt.server_args import ServerArgs
@@ -335,18 +498,15 @@ def create_sglang_tts_engine_executor(
         _load_audio_decoder(model_path, device)
     )
 
-    # Lazy-init: codec + upsample ratio measured on first streaming request.
-    _stream_codec: Any = None
-    _total_upsample: int = 0
+    # Eagerly load and warm up the stream codec at factory time to avoid
+    # 500ms-2s cold-start latency on the first streaming request.
+    logger.info("Eagerly loading stream codec for TTFA optimization …")
+    _stream_codec = _load_codec(checkpoint_dir, stream_vocoder_device)
+    _total_upsample = _warmup_codec(
+        _stream_codec, num_codebooks=num_codebooks, device=stream_vocoder_device
+    )
 
     def _get_stream_codec() -> tuple[Any, int]:
-        nonlocal _stream_codec, _total_upsample
-        if _stream_codec is None:
-            codec = _load_codec(checkpoint_dir, stream_vocoder_device)
-            _total_upsample = _warmup_codec(
-                codec, num_codebooks=num_codebooks, device=stream_vocoder_device
-            )
-            _stream_codec = codec
         return _stream_codec, _total_upsample
 
     _patch_fish_config_for_sglang(checkpoint_dir)
@@ -369,6 +529,7 @@ def create_sglang_tts_engine_executor(
         codebook_size=codebook_size,
         max_new_tokens=max_new_tokens,
         top_k=top_k,
+        batch_window_ms=batch_window_ms,
     )
 
     def _request_builder(payload: StagePayload):
@@ -387,6 +548,9 @@ def create_sglang_tts_engine_executor(
                 "completion_tokens": state.completion_tokens,
                 "total_tokens": state.prompt_tokens + state.completion_tokens,
             }
+        # Strip the live S2ProState before the payload leaves this stage
+        # (it can't be serialized by msgpack for ZMQ transport).
+        strip_live_state(payload.data)
         return payload
 
     async def _stream_builder(
@@ -477,6 +641,60 @@ def create_sglang_tts_engine_executor(
             }
 
         return await asyncio.to_thread(_vocode)
+
+    def _flush_stream(payload: StagePayload | None) -> dict[str, Any] | None:
+        """Flush remaining un-vocoded tokens when the stream ends.
+
+        Called by EngineExecutor after the last stream item. Without this,
+        tokens accumulated after the last periodic vocode are lost — causing
+        audio to be cut off at the end.
+        """
+        if payload is None or not isinstance(payload.data, dict):
+            return None
+
+        stream_codes = payload.data.get(_STREAM_CODES_KEY)
+        if not stream_codes:
+            return None
+
+        base_offset = int(payload.data.get("_stream_base_offset", 0))
+        abs_total = base_offset + len(stream_codes)
+        prev_end = int(payload.data.get(_STREAM_LAST_VOCODE_TOKENS_KEY, 0))
+        if abs_total <= prev_end:
+            return None  # nothing new to vocode
+
+        codec, upsample = _get_stream_codec()
+        ctx = min(stream_left_context, prev_end)
+        window_start = prev_end - ctx
+        local_start = window_start - base_offset
+
+        window_codes = torch.cat(stream_codes[local_start:], dim=1)
+        codebook_input = window_codes[1:].to(stream_vocoder_device)
+
+        trim_samples = ctx * upsample
+        sample_rate = codec.sample_rate
+
+        with torch.no_grad():
+            audio = codec.from_indices(codebook_input[None])
+        audio_flat = audio[0, 0].float().cpu()
+        if trim_samples >= audio_flat.shape[-1]:
+            return None
+        delta = (
+            audio_flat[trim_samples:].contiguous()
+            if trim_samples > 0
+            else audio_flat.contiguous()
+        )
+        if delta.numel() == 0:
+            return None
+        return {
+            "audio_waveform": delta.numpy().tobytes(),
+            "audio_waveform_shape": list(delta.shape),
+            "audio_waveform_dtype": "float32",
+            "sample_rate": sample_rate,
+            "modality": "audio",
+        }
+
+    # Attach flush so EngineExecutor calls it after the last stream item
+    _stream_builder.flush = _flush_stream  # type: ignore[attr-defined]
 
     return EngineExecutor(
         engine=engine,
