@@ -51,7 +51,7 @@ REF_TEXT_FILE = "benchmark_audio/reference.txt"
 # ~10s of speech — intentionally different from reference audio to test
 # novel content generation, not parroting. Keep consistent across runs.
 DEFAULT_TEXT = (
-    "Good afternoon, I wanted to follow up on our conversation from last week "
+    "Good afternoon. I wanted to follow up on our conversation from last week "
     "regarding the solar panel installation for your property. We have a few "
     "different options available that I think would work really well for your "
     "situation, and I would love to walk you through them whenever you have a moment."
