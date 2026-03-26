@@ -24,9 +24,8 @@ env/
 .DS_Store
 Thumbs.db
 
-# Benchmark artifacts
+# Benchmark audio (large WAV files)
 benchmark_audio/
-benchmark_ttfa.py
 output.wav
 
 # Logs
