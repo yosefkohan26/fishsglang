@@ -23,7 +23,6 @@ Import all source files for full context.
 - @./sglang_omni/config/__init__.py
 - @./sglang_omni/config/compiler.py
 - @./sglang_omni/config/manager.py
-- @./sglang_omni/config/qwen3_omni.py
 - @./sglang_omni/config/runner.py
 - @./sglang_omni/config/schema.py
 
@@ -114,34 +113,6 @@ Import all source files for full context.
 - @./sglang_omni/models/fishaudio_s2_pro/fish_speech/models/text2semantic/modeling.py
 - @./sglang_omni/models/fishaudio_s2_pro/fish_speech/models/text2semantic/utils.py
 
-## Models - Qwen3 Omni
-- @./sglang_omni/models/qwen3_omni/__init__.py
-- @./sglang_omni/models/qwen3_omni/config.py
-- @./sglang_omni/models/qwen3_omni/hf_config.py
-- @./sglang_omni/models/qwen3_omni/io.py
-- @./sglang_omni/models/qwen3_omni/talker.py
-- @./sglang_omni/models/qwen3_omni/thinker.py
-
-## Models - Qwen3 Omni Components
-- @./sglang_omni/models/qwen3_omni/components/__init__.py
-- @./sglang_omni/models/qwen3_omni/components/audio_encoder.py
-- @./sglang_omni/models/qwen3_omni/components/code2wav_executor.py
-- @./sglang_omni/models/qwen3_omni/components/code_predictor_executor.py
-- @./sglang_omni/models/qwen3_omni/components/common.py
-- @./sglang_omni/models/qwen3_omni/components/image_encoder.py
-- @./sglang_omni/models/qwen3_omni/components/preprocessor.py
-- @./sglang_omni/models/qwen3_omni/components/talker_executor.py
-- @./sglang_omni/models/qwen3_omni/components/talker_input.py
-- @./sglang_omni/models/qwen3_omni/components/thinker.py
-
-## Models - Qwen3 Omni Pipeline
-- @./sglang_omni/models/qwen3_omni/pipeline/__init__.py
-- @./sglang_omni/models/qwen3_omni/pipeline/engine_io.py
-- @./sglang_omni/models/qwen3_omni/pipeline/merge.py
-- @./sglang_omni/models/qwen3_omni/pipeline/next_stage.py
-- @./sglang_omni/models/qwen3_omni/pipeline/stages.py
-- @./sglang_omni/models/qwen3_omni/pipeline/state_io.py
-
 ## Pipeline
 - @./sglang_omni/pipeline/__init__.py
 - @./sglang_omni/pipeline/control_plane.py
@@ -162,10 +133,8 @@ Import all source files for full context.
 - @./sglang_omni/preprocessing/audio.py
 - @./sglang_omni/preprocessing/base.py
 - @./sglang_omni/preprocessing/cache_key.py
-- @./sglang_omni/preprocessing/image.py
 - @./sglang_omni/preprocessing/resource_connector.py
 - @./sglang_omni/preprocessing/text.py
-- @./sglang_omni/preprocessing/video.py
 
 ## Profiler
 - @./sglang_omni/profiler/base_profiler.py
