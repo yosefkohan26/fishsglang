@@ -680,7 +680,7 @@ def create_sglang_tts_engine_executor(
         trim_samples = max(ctx, 0) * upsample
         sample_rate = codec.sample_rate
 
-        with _codec_lock, torch.no_grad():
+        with torch.no_grad():
             audio = codec.from_indices(codebook_input[None])
         audio_flat = audio[0, 0].float().cpu()
         if trim_samples >= audio_flat.shape[-1]:
