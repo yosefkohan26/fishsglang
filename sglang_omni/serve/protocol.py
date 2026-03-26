@@ -192,12 +192,6 @@ class CreateSpeechRequest(BaseModel):
     repetition_penalty: float | None = None
     seed: int | None = None
 
-    # Input chunking: split text into sentences and generate each chunk
-    # separately for lower TTFA at high concurrency. Each chunk shares the
-    # voice prefix via RadixCache, so prefill is just the short sentence text.
-    chunked_input: bool = False
-    chunk_sentences: int = 2  # sentences per chunk (1=lowest TTFA, 2-3=better prosody)
-
     # Per-stage overrides (sglang-omni specific)
     stage_params: dict[str, dict[str, Any]] | None = None
 
