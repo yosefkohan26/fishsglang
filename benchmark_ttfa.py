@@ -48,12 +48,13 @@ WARMUP_ROUNDS = 3
 REF_AUDIO = "benchmark_audio/reference.wav"
 REF_TEXT_FILE = "benchmark_audio/reference.txt"
 
-# ~10s of speech
+# ~10s of speech — intentionally different from reference audio to test
+# novel content generation, not parroting. Keep consistent across runs.
 DEFAULT_TEXT = (
-    "Hi, my name is Joseph, and I am calling you from the Energy Efficiency Agency. "
-    "The reason for my call today is because I wanted to see if I can provide you any "
-    "services that will benefit and better your experience working in our industry. "
-    "Please call me back at any time."
+    "Good afternoon, I wanted to follow up on our conversation from last week "
+    "regarding the solar panel installation for your property. We have a few "
+    "different options available that I think would work really well for your "
+    "situation, and I would love to walk you through them whenever you have a moment."
 )
 
 
