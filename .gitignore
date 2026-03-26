@@ -24,8 +24,9 @@ env/
 .DS_Store
 Thumbs.db
 
-# Benchmark audio (large WAV files)
+# Benchmark artifacts (large WAV files)
 benchmark_audio/
+benchmark_runs/
 output.wav
 
 # Logs
