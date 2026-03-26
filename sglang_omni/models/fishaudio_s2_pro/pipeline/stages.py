@@ -505,6 +505,10 @@ def create_sglang_tts_engine_executor(
     _total_upsample = _warmup_codec(
         _stream_codec, num_codebooks=num_codebooks, device=stream_vocoder_device
     )
+    # Lock to serialize codec.from_indices() calls. The DAC codec's causal
+    # convolutions have internal padding state that is not thread-safe —
+    # concurrent vocode threads corrupt each other's buffers, causing glitches.
+    _codec_lock = threading.Lock()
 
     def _get_stream_codec() -> tuple[Any, int]:
         return _stream_codec, _total_upsample
@@ -619,7 +623,7 @@ def create_sglang_tts_engine_executor(
 
         # ── Slow path: vocode in thread (engine keeps generating) ──
         def _vocode() -> dict[str, Any] | None:
-            with torch.no_grad():
+            with _codec_lock, torch.no_grad():
                 audio = codec.from_indices(codebook_input[None])
             audio_flat = audio[0, 0].float().cpu()
             if trim_samples >= audio_flat.shape[-1]:
@@ -666,14 +670,22 @@ def create_sglang_tts_engine_executor(
         ctx = min(stream_left_context, prev_end)
         window_start = prev_end - ctx
         local_start = window_start - base_offset
+        # Guard against negative index from code eviction
+        if local_start < 0:
+            ctx = ctx + local_start  # reduce context by the missing amount
+            local_start = 0
+        if local_start >= len(stream_codes):
+            return None
 
         window_codes = torch.cat(stream_codes[local_start:], dim=1)
         codebook_input = window_codes[1:].to(stream_vocoder_device)
+        if codebook_input.shape[1] == 0:
+            return None
 
-        trim_samples = ctx * upsample
+        trim_samples = max(ctx, 0) * upsample
         sample_rate = codec.sample_rate
 
-        with torch.no_grad():
+        with _codec_lock, torch.no_grad():
             audio = codec.from_indices(codebook_input[None])
         audio_flat = audio[0, 0].float().cpu()
         if trim_samples >= audio_flat.shape[-1]:
