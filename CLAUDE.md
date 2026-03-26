@@ -8,21 +8,37 @@ To load all source files into context memory, read `fishsglang/readallfiles/read
 
 1. Make your changes
 2. `git add` and `git commit` with a descriptive message
-3. Start the server: `python -m sglang_omni.cli.cli serve --model-path fishaudio/s2-pro --port 8000`
-4. Run the benchmark:
-   ```
-   python benchmark_ttfa.py -d "description of what changed"
-   ```
-5. Results append to `benchmark_results.csv` with git commit, GPU, timestamps
+3. Restart the server: `./restart_server.sh`
+4. Run the benchmark: `python benchmark_ttfa.py -d "description of what changed"`
+5. Review audio quality: listen to files in `benchmark_runs/<latest>/conc_008/*.wav`
+6. Commit results: `git add benchmark_results.csv && git commit -m "benchmark: ..."`
 
 The benchmark enforces a clean git state by default. Use `--allow-dirty` to override during development.
 
-### Benchmark options
+### Server commands
+```bash
+./restart_server.sh          # kill, free GPU, start fresh, wait until ready (port 8000)
+./restart_server.sh 9000     # custom port
 ```
-python benchmark_ttfa.py -d "my change"                    # full suite with voice
-python benchmark_ttfa.py -d "my change" --no-voice         # without voice cloning
+
+The restart script:
+- Kills any running sglang_omni process
+- Waits 5s for GPU memory to free
+- Starts the server in background with logs to `/tmp/sglang_server_<port>.log`
+- Polls health endpoint every 10s until ready (up to 15 min timeout)
+- Exits with error if server dies during startup
+
+### Benchmark commands
+```bash
+python benchmark_ttfa.py -d "my change"                         # full suite with voice
+python benchmark_ttfa.py -d "my change" --no-voice              # without voice cloning
 python benchmark_ttfa.py -d "quick test" --concurrencies 1 4 8  # subset
 ```
+
+Each run creates `benchmark_runs/<timestamp>_<commit>_<description>/` with:
+- `run_info.json` — git commit, GPU, description, text, params
+- `details.csv` — per-request TTFA, audio duration, chunk count, errors
+- `conc_001/req_000.wav`, `conc_008/req_003.wav`, etc — actual audio files
 
 ### Key files for performance work
 - `sglang_omni/engines/omni/engine.py` — engine loop, batch window, event-driven wakeup
