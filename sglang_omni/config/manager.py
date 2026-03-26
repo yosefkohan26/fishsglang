@@ -1,8 +1,10 @@
 from copy import deepcopy
 from typing import Any
 
+import json
+
 import yaml
-from transformers import AutoConfig
+from huggingface_hub import hf_hub_download
 
 from sglang_omni.config.schema import PipelineConfig
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
@@ -95,8 +97,31 @@ class ConfigManager:
         """
         Load the configuration from the model path.
         """
-        hf_config = AutoConfig.from_pretrained(model_path)
-        config_cls = PIPELINE_CONFIG_REGISTRY.get_config(hf_config.architectures[0])
+        try:
+            config_file = hf_hub_download(model_path, "config.json")
+        except Exception:
+            import os
+            config_file = os.path.join(model_path, "config.json")
+        with open(config_file, "r") as f:
+            raw_config = json.load(f)
+        architectures = raw_config.get("architectures", [])
+        if architectures:
+            config_cls = PIPELINE_CONFIG_REGISTRY.get_config(architectures[0])
+        else:
+            # Fall back: try to match model_type to a registered architecture
+            model_type = raw_config.get("model_type", "")
+            matched = None
+            for arch in PIPELINE_CONFIG_REGISTRY.get_supported_archs():
+                if model_type.replace("_", "").lower() in arch.lower():
+                    matched = arch
+                    break
+            if matched is None:
+                raise ValueError(
+                    f"No architectures found in config.json and could not match "
+                    f"model_type '{model_type}' to any registered architecture. "
+                    f"Supported: {list(PIPELINE_CONFIG_REGISTRY.get_supported_archs())}"
+                )
+            config_cls = PIPELINE_CONFIG_REGISTRY.get_config(matched)
         config = config_cls(model_path=model_path)
         return ConfigManager(config)
 
