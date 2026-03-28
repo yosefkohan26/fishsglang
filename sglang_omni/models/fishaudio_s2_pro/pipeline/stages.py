@@ -419,7 +419,6 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
             cached = get_cached_voice(voice_id)
             if cached is not None:
                 cache_hit = True
-                logger.debug("Voice cache hit for voice_id=%s", voice_id)
                 references = [
                     Reference(audio_bytes=b"", text=cached.ref_text, vq_codes=cached.vq_codes)
                 ]
@@ -461,6 +460,9 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
                 references=references,
                 num_codebooks=num_codebooks,
             )
+            # Cache prompt prefix for this voice on first full build
+            if voice_id and references and not cache_hit:
+                _cache_prompt_prefix(voice_id, text, prompt_data, adapter, num_codebooks)
 
         t_prompt = time.perf_counter()
 
@@ -509,9 +511,15 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
                     # Fast path: load pre-encoded VQ codes (~1ms)
                     vq_codes = torch.load(codes_file, map_location="cpu", weights_only=True)
                     put_cached_voice(voice_name, vq_codes, ref_text)
+                    # Build and cache prompt prefix so first request is fast
+                    ref = Reference(audio_bytes=b"", text=ref_text, vq_codes=vq_codes)
+                    full_prompt = adapter.build_prompt(
+                        text=".", references=[ref], num_codebooks=10,
+                    )
+                    _cache_prompt_prefix(voice_name, ".", full_prompt, adapter, 10)
                     elapsed = time.perf_counter() - t_start
                     logger.info(
-                        "  Loaded voice '%s' from codes.pt in %.0fms (%d VQ frames)",
+                        "  Loaded voice '%s' from codes.pt in %.0fms (%d VQ frames, prefix cached)",
                         voice_name, elapsed * 1000, vq_codes.shape[-1],
                     )
                 else:

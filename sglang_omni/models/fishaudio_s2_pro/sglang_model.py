@@ -302,6 +302,34 @@ class S2ProSGLangTextModel(nn.Module):
 
         self._vq_ready = True
 
+        # Fast AR codebook loop — eager mode (torch.compile adds dispatch
+        # overhead that exceeds kernel savings at small batch sizes)
+        self._compiled_codebook_loop = self._codebook_loop
+
+    def _codebook_loop(
+        self, hidden_states: Tensor, semantic_token: Tensor, bs: int
+    ) -> None:
+        """Fast AR codebook generation — compilable with fullgraph=True."""
+        self._audio_decoder.reset_caches()
+        fast_input = self._audio_decoder.project_in(hidden_states)
+        fast_input = fast_input.unsqueeze(1)
+        self._audio_decoder.forward_kvcached(fast_input, codebook_idx=0)
+
+        sem_id = (semantic_token - self._semantic_begin_id).clamp(min=0)
+        cb_hidden = self._audio_decoder.embeddings(sem_id).unsqueeze(1)
+
+        self._output_codes[:bs, 0] = semantic_token
+        self._output_codes[:bs, 1] = sem_id
+
+        for cb_idx in range(1, self._num_codebooks):
+            cb_logits = self._audio_decoder.forward_kvcached(
+                cb_hidden, codebook_idx=cb_idx
+            )
+            cb_logits = cb_logits[:, 0, : self._codebook_size]
+            cb_token = torch.argmax(cb_logits, dim=-1)
+            cb_hidden = self._audio_decoder.embeddings(cb_token).unsqueeze(1)
+            self._output_codes[:bs, cb_idx + 1] = cb_token
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -434,26 +462,8 @@ class S2ProSGLangTextModel(nn.Module):
 
         semantic_token = self._output_semantic_ids[:bs]
 
-        # Batched codebook loop (fast AR)
-        self._audio_decoder.reset_caches()
-        fast_input = self._audio_decoder.project_in(hidden_states)
-        fast_input = fast_input.unsqueeze(1)
-        self._audio_decoder.forward_kvcached(fast_input, codebook_idx=0)
-
-        sem_id = (semantic_token - self._semantic_begin_id).clamp(min=0)
-        cb_hidden = self._audio_decoder.embeddings(sem_id).unsqueeze(1)
-
-        self._output_codes[:bs, 0] = semantic_token
-        self._output_codes[:bs, 1] = sem_id
-
-        for cb_idx in range(1, self._num_codebooks):
-            cb_logits = self._audio_decoder.forward_kvcached(
-                cb_hidden, codebook_idx=cb_idx
-            )
-            cb_logits = cb_logits[:, 0, : self._codebook_size]
-            cb_token = torch.argmax(cb_logits, dim=-1)
-            cb_hidden = self._audio_decoder.embeddings(cb_token).unsqueeze(1)
-            self._output_codes[:bs, cb_idx + 1] = cb_token
+        # Batched codebook loop (fast AR) — torch.compiled
+        self._compiled_codebook_loop(hidden_states, semantic_token, bs)
 
     # ------------------------------------------------------------------
     # Helpers
