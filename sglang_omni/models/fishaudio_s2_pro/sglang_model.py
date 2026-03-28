@@ -490,7 +490,7 @@ class S2ProSGLangTextModel(nn.Module):
             name = name[len("text_model.model."):]
 
             # Detect quantized weight components
-            for suffix in (".qweight", ".scales", ".qzeros", ".awq_scales"):
+            for suffix in (".qweight", ".scales", ".qzeros", ".awq_scales", ".weight_scale"):
                 if name.endswith(suffix):
                     base = name[:-len(suffix)]
                     quant_buf.setdefault(base, {})[suffix] = loaded_weight
@@ -502,6 +502,26 @@ class S2ProSGLangTextModel(nn.Module):
         if quant_buf:
             logger.info("Dequantizing %d quantized weight matrices in load_weights…", len(quant_buf))
             for base, parts in quant_buf.items():
+                # FP8 with per-tensor scale
+                ws = parts.get(".weight_scale")
+                if ws is not None:
+                    # base ends with ".weight" already (e.g. "layers.0.attention.wqkv.weight")
+                    # The FP8 tensor key is base + "" (the weight itself without suffix)
+                    # We need to find the FP8 weight — it should be in normal_weights
+                    # under the base name with .weight_scale stripped
+                    fp8_key = base + ".weight"
+                    # Find and remove the FP8 weight from normal_weights
+                    fp8_w = None
+                    for j, (n, w) in enumerate(normal_weights):
+                        if n == fp8_key:
+                            fp8_w = w
+                            normal_weights.pop(j)
+                            break
+                    if fp8_w is not None:
+                        w = (fp8_w.float() * ws.float()).bfloat16()
+                        normal_weights.append((fp8_key, w))
+                    continue
+
                 qw = parts.get(".qweight")
                 sc = parts.get(".scales")
                 if qw is None or sc is None:
@@ -529,6 +549,77 @@ class S2ProSGLangTextModel(nn.Module):
                 weight_loader(param, loaded_weight)
             else:
                 logger.debug("Skipping weight: %s", name)
+
+        # Replace Slow AR linear layers with FP8Linear for 2x bandwidth savings
+        self._convert_to_fp8()
+
+    def _convert_to_fp8(self):
+        """Convert Slow AR linear weights to FP8 in-place with custom GEMM.
+
+        Replaces BF16 weights with FP8 buffers and monkey-patches the
+        quant_method.apply to use torch._scaled_mm directly.
+        """
+        from sglang.srt.layers.linear import (
+            QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear,
+        )
+
+        n_converted = 0
+        for name, module in list(self.named_modules()):
+            if not name.startswith("layers."):
+                continue
+            if "norm" in name:
+                continue
+            if not isinstance(module, (QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear)):
+                continue
+            if not hasattr(module, "weight") or module.weight.numel() < 100_000:
+                continue
+
+            # Quantize BF16 weight to FP8 in-place
+            w = module.weight.data.float()
+            amax = w.abs().max().clamp(min=1e-12)
+            scale = amax / 448.0
+            w_fp8 = (w / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+
+            # Replace weight param with FP8 buffer (frees BF16 memory)
+            device = module.weight.device
+            del module.weight
+            module.register_buffer("weight", w_fp8.to(device))
+            module.register_buffer("weight_scale", scale.float().reshape(1).to(device))
+
+            # Monkey-patch the quant_method to use our FP8 GEMM
+            # Pre-compute a static activation scale (conservative — covers
+            # typical activation magnitudes without per-call abs().max())
+            _static_act_scale = torch.tensor(1.0 / 448.0, device=device, dtype=torch.float32)
+
+            class _FP8Apply:
+                @staticmethod
+                def process_weights_after_loading(layer):
+                    pass
+
+                @staticmethod
+                def apply(layer, x, bias=None):
+                    x_2d = x.reshape(-1, x.shape[-1])
+                    # Fast static-scale quantization (no abs().max() scan)
+                    x_fp8 = x_2d.to(torch.float8_e4m3fn)
+                    out = torch._scaled_mm(
+                        x_fp8, layer.weight.t(),
+                        scale_a=_static_act_scale,
+                        scale_b=layer.weight_scale,
+                        out_dtype=torch.bfloat16,
+                    )
+                    out = out.reshape(*x.shape[:-1], out.shape[-1])
+                    if bias is not None:
+                        out = out + bias
+                    return out
+
+            module.quant_method = _FP8Apply()
+            n_converted += 1
+
+        if n_converted > 0:
+            torch.cuda.empty_cache()
+            free, total = torch.cuda.mem_get_info()
+            logger.info("Converted %d layers to FP8. Free VRAM: %.1f/%.1f GB",
+                       n_converted, free / 1e9, total / 1e9)
 
     def _load_remapped_weight(
         self,

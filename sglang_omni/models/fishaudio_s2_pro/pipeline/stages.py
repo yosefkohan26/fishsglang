@@ -605,8 +605,8 @@ def create_sglang_tts_engine_executor(
         model_path=checkpoint_dir,
         tp_size=1,
         dtype="bfloat16",
+        # FP8 quantization requires pre-quantized checkpoint — see quantize_fp8.py
         attention_backend="fa3",  # Must match training; flashinfer causes dynamo conflicts
-        # kv_cache_dtype="fp8_e4m3",  # disabled: causes early EOS without calibrated scales
         mem_fraction_static=0.85,
         chunked_prefill_size=8192,
         max_running_requests=48,
