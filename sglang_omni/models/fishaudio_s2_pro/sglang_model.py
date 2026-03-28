@@ -386,9 +386,10 @@ class S2ProSGLangTextModel(nn.Module):
         else:
             logits = self.lm_head(hidden_states)
 
-        # Codebook decode: constrained sampling + batched codebook loop
-        if self._vq_ready:
-            self._decode_codebooks(logits, hidden_states)
+        # NOTE: _decode_codebooks is called AFTER forward() by the
+        # ModelRunner (S2ProSGLangModelRunner.execute).  Keeping it
+        # outside forward() allows the transformer to be captured by
+        # CUDA graphs (multinomial is not graph-capturable).
 
         return LogitsProcessorOutput(
             next_token_logits=logits,

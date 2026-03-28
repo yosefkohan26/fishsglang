@@ -552,6 +552,7 @@ class S2ProSGLangModelRunner:
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.model_worker.model_runner
         )
+        # Transformer forward (graph-capturable: no multinomial/non-det ops).
         batch_result = self.model_worker.forward_batch_generation(forward_batch)
 
         if schedule_batch.is_prefill_only:
@@ -560,6 +561,14 @@ class S2ProSGLangModelRunner:
                 dtype=torch.long,
                 device=model_worker_batch.input_ids.device,
             )
+        else:
+            # Codebook decode runs OUTSIDE the CUDA graph: constrained
+            # semantic sampling (multinomial) + fast AR codebook loop.
+            text_model = self.model_worker.model_runner.model
+            if text_model._vq_ready:
+                logits = batch_result.logits_output.next_token_logits
+                hidden = batch_result.logits_output.hidden_states
+                text_model._decode_codebooks(logits, hidden)
 
         self.batch_planner.record_last_batch(schedule_batch)
 
