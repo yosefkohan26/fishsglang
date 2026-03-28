@@ -58,13 +58,13 @@ _STD_CENTROIDS_3BIT = [
 # Bit packing — torch.compile fuses the element-wise ops
 # ===================================================================
 
-@torch.compile(fullgraph=True, dynamic=True)
+# @torch.compile  # disabled: JIT overhead > savings for variable shapes
 def _pack_4bit(idx: Tensor) -> Tensor:
     """[..., 64] int -> [..., 32] uint8.  Two nibbles per byte."""
     return (idx[..., 0::2] | (idx[..., 1::2] << 4)).to(torch.uint8)
 
 
-@torch.compile(fullgraph=True, dynamic=True)
+# @torch.compile  # disabled: JIT overhead > savings for variable shapes
 def _unpack_4bit(packed: Tensor) -> Tensor:
     """[..., 32] uint8 -> [..., 64] long."""
     low = (packed & 0xF).long()
@@ -72,7 +72,7 @@ def _unpack_4bit(packed: Tensor) -> Tensor:
     return torch.stack([low, high], dim=-1).reshape(*packed.shape[:-1], 64)
 
 
-@torch.compile(fullgraph=True, dynamic=True)
+# @torch.compile  # disabled: JIT overhead > savings for variable shapes
 def _pack_3bit(idx: Tensor) -> Tensor:
     """[..., 64] int -> [..., 24] uint8.  Eight 3-bit values into 3 bytes."""
     g = idx.view(*idx.shape[:-1], 8, 8).int()
@@ -85,7 +85,7 @@ def _pack_3bit(idx: Tensor) -> Tensor:
     ).to(torch.uint8)
 
 
-@torch.compile(fullgraph=True, dynamic=True)
+# @torch.compile  # disabled: JIT overhead > savings for variable shapes
 def _unpack_3bit(packed: Tensor) -> Tensor:
     """[..., 24] uint8 -> [..., 64] long."""
     g = packed.view(*packed.shape[:-1], 8, 3).int()
