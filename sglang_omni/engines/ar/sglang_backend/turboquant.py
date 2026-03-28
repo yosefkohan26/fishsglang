@@ -157,9 +157,16 @@ class TurboQuantKVPool(MHATokenToKVPool):
 
     def set_kv_buffer(self, layer, cache_loc, k, v, k_scale=None, v_scale=None):
         layer_id = layer.layer_id
-        
-        k_pack = self.tq.quantize(k)
-        v_pack = self.tq.quantize(v)
+
+        try:
+            k_pack = self.tq.quantize(k)
+            v_pack = self.tq.quantize(v)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(
+                f"TQ quantize failed: k={k.shape} v={v.shape} cache_loc={cache_loc.shape} err={e}"
+            )
+            raise
         
         self.k_idx_out[layer_id, cache_loc] = k_pack[0]
         self.k_idx_in[layer_id, cache_loc] = k_pack[1]
@@ -227,15 +234,26 @@ def inject_turboquant(model_runner):
     layer_num = pool.layer_num
     device = pool.device
 
-    # Free old BF16 KV pool GPU memory BEFORE allocating TQ pool
+    # Force-free every tensor in the old KV pool
+    # 1. Zero the buffer lists (36 tensors each, ~200MB per tensor)
     if hasattr(pool, 'k_buffer') and pool.k_buffer is not None:
-        for buf in pool.k_buffer:
-            del buf
+        for i in range(len(pool.k_buffer)):
+            pool.k_buffer[i] = None
+        pool.k_buffer = None
     if hasattr(pool, 'v_buffer') and pool.v_buffer is not None:
-        for buf in pool.v_buffer:
-            del buf
+        for i in range(len(pool.v_buffer)):
+            pool.v_buffer[i] = None
+        pool.v_buffer = None
+    # 2. Clear derived pointer tensors
+    for attr in ('k_data_ptrs', 'v_data_ptrs', 'data_ptrs', 'data_strides'):
+        if hasattr(pool, attr):
+            setattr(pool, attr, None)
+    # 3. Drop the pool reference itself
     del pool
     model_runner.token_to_kv_pool = None
+    # 4. Force Python GC + CUDA cache clear
+    import gc
+    gc.collect()
     torch.cuda.empty_cache()
 
     free_before = torch.cuda.mem_get_info()[0]
