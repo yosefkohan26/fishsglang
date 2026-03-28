@@ -192,13 +192,6 @@ class OmniEngine(Engine):
                 await asyncio.wait_for(self._work_event.wait(), timeout=0.005)
             except asyncio.TimeoutError:
                 pass
-            # Batch accumulation window: if new work arrived and we have a
-            # batch window configured, wait briefly so concurrent requests
-            # land in the scheduler before the next schedule() call.
-            # PrefillAdder will then batch all waiting requests into one
-            # GPU forward pass instead of processing them one at a time.
-            if self._work_event.is_set() and self._batch_window_s > 0:
-                await asyncio.sleep(self._batch_window_s)
             return False
 
         try:
