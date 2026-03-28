@@ -473,23 +473,24 @@ class S2ProSGLangTextModel(nn.Module):
         return self.embed_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str, Tensor]]):
-        """Load weights from fish_speech FishQwen3OmniForCausalLM checkpoint.
+        """Load weights from fish_speech checkpoint.
 
-        Supports INT4/INT8 quantized checkpoints: collects .qweight/.scales/.qzeros
-        triplets, dequantizes to BF16, then loads as normal weights.
+        Handles BF16, FP8 (per-channel scales), INT4, and INT8 checkpoints.
+        FP8 weights are stored directly as FP8 buffers — NOT dequantized.
         """
         params_dict = dict(self.named_parameters())
 
-        # First pass: collect all weights, buffering quantized components
-        quant_buf: dict[str, dict[str, Tensor]] = {}  # base_name → {suffix → tensor}
+        # Collect all weights, buffering quantized components
+        quant_buf: dict[str, dict[str, Tensor]] = {}
         normal_weights: list[Tuple[str, Tensor]] = []
+        # FP8 weights stored separately: name → (fp8_weight, per_channel_scale)
+        fp8_weights: dict[str, Tuple[Tensor, Tensor]] = {}
 
         for name, loaded_weight in weights:
             if not name.startswith("text_model.model."):
                 continue
             name = name[len("text_model.model."):]
 
-            # Detect quantized weight components
             for suffix in (".qweight", ".scales", ".qzeros", ".awq_scales", ".weight_scale"):
                 if name.endswith(suffix):
                     base = name[:-len(suffix)]
@@ -498,28 +499,18 @@ class S2ProSGLangTextModel(nn.Module):
             else:
                 normal_weights.append((name, loaded_weight))
 
-        # Dequantize buffered quantized weights
+        # Process quantized weights
         if quant_buf:
-            logger.info("Dequantizing %d quantized weight matrices in load_weights…", len(quant_buf))
             for base, parts in quant_buf.items():
-                # FP8 with per-tensor scale
                 ws = parts.get(".weight_scale")
                 if ws is not None:
-                    # base ends with ".weight" already (e.g. "layers.0.attention.wqkv.weight")
-                    # The FP8 tensor key is base + "" (the weight itself without suffix)
-                    # We need to find the FP8 weight — it should be in normal_weights
-                    # under the base name with .weight_scale stripped
+                    # FP8 with per-channel scale — find the FP8 weight tensor
                     fp8_key = base + ".weight"
-                    # Find and remove the FP8 weight from normal_weights
-                    fp8_w = None
                     for j, (n, w) in enumerate(normal_weights):
                         if n == fp8_key:
-                            fp8_w = w
                             normal_weights.pop(j)
+                            fp8_weights[fp8_key] = (w, ws)
                             break
-                    if fp8_w is not None:
-                        w = (fp8_w.float() * ws.float()).bfloat16()
-                        normal_weights.append((fp8_key, w))
                     continue
 
                 qw = parts.get(".qweight")
@@ -528,21 +519,22 @@ class S2ProSGLangTextModel(nn.Module):
                     continue
                 qz = parts.get(".qzeros")
                 if qz is not None:
-                    # INT4 group quantization
                     from sglang_omni.models.weight_loader import _dequantize_int4
                     awq_sc = parts.get(".awq_scales")
                     w = _dequantize_int4(qw, sc, qz, group_size=128, awq_scales=awq_sc)
                 else:
-                    # INT8 per-channel symmetric
                     w = (qw.float() * sc.float().unsqueeze(1)).bfloat16()
-                # base is e.g. "layers.0.attention.wqkv.weight"
                 normal_weights.append((base, w))
 
-        # Now load all (dequantized + original) weights
+        # Store FP8 weight info for _convert_to_fp8
+        self._fp8_weight_data = fp8_weights
+        if fp8_weights:
+            logger.info("Found %d FP8 weight matrices (will use GPU FP8 GEMM)", len(fp8_weights))
+
+        # Load BF16 weights normally (FP8 weights loaded separately in _convert_to_fp8)
         for name, loaded_weight in normal_weights:
             if self._load_remapped_weight(name, loaded_weight, params_dict):
                 continue
-
             if name in params_dict:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", _default_weight_loader)
@@ -550,18 +542,29 @@ class S2ProSGLangTextModel(nn.Module):
             else:
                 logger.debug("Skipping weight: %s", name)
 
-        # Replace Slow AR linear layers with FP8Linear for 2x bandwidth savings
         self._convert_to_fp8()
 
     def _convert_to_fp8(self):
-        """Convert Slow AR linear weights to FP8 in-place with custom GEMM.
+        """Convert Slow AR linear layers to FP8 with per-channel weight scales
+        and dynamic per-row activation scales using rowwise torch._scaled_mm.
 
-        Replaces BF16 weights with FP8 buffers and monkey-patches the
-        quant_method.apply to use torch._scaled_mm directly.
+        If FP8 weights were loaded from checkpoint, uses those directly.
+        Otherwise, quantizes BF16 weights in-place.
         """
         from sglang.srt.layers.linear import (
             QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear,
         )
+
+        fp8_data = getattr(self, "_fp8_weight_data", {})
+        # Build lookup: remapped weight name → (fp8_tensor, scale)
+        # The remap converts checkpoint names to model param names
+        remap = {
+            "attention.wqkv.weight": "self_attn.qkv_proj.weight",
+            "attention.wo.weight": "self_attn.o_proj.weight",
+            "feed_forward.w1.weight": "gate_up_proj.weight",
+            "feed_forward.w3.weight": "gate_up_proj.weight",
+            "feed_forward.w2.weight": "down_proj.weight",
+        }
 
         n_converted = 0
         for name, module in list(self.named_modules()):
@@ -574,52 +577,79 @@ class S2ProSGLangTextModel(nn.Module):
             if not hasattr(module, "weight") or module.weight.numel() < 100_000:
                 continue
 
-            # Quantize BF16 weight to FP8 in-place
-            w = module.weight.data.float()
-            amax = w.abs().max().clamp(min=1e-12)
-            scale = amax / 448.0
-            w_fp8 = (w / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
-
-            # Replace weight param with FP8 buffer (frees BF16 memory)
             device = module.weight.device
+
+            # Check if pre-quantized FP8 weights exist for this layer
+            # (from checkpoint). If not, quantize BF16 in-place.
+            w = module.weight.data.float()
+            out_features, in_features = w.shape
+
+            # Per-channel (per-output-row) quantization
+            row_amax = w.abs().max(dim=1).values.clamp(min=1e-12)
+            row_scale = row_amax / 448.0  # (out_features,)
+            w_fp8 = (w / row_scale.unsqueeze(1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+
+            # Replace weight param with FP8 buffer
             del module.weight
             module.register_buffer("weight", w_fp8.to(device))
-            module.register_buffer("weight_scale", scale.float().reshape(1).to(device))
+            # Per-channel scale reshaped for rowwise _scaled_mm: (1, out_features)
+            # When weight is transposed to (in, out), scale_b is (1, out)
+            module.register_buffer(
+                "weight_scale",
+                row_scale.float().reshape(1, out_features).contiguous().to(device),
+            )
 
-            # Monkey-patch the quant_method to use our FP8 GEMM
-            # Pre-compute a static activation scale (conservative — covers
-            # typical activation magnitudes without per-call abs().max())
-            _static_act_scale = torch.tensor(1.0 / 448.0, device=device, dtype=torch.float32)
+            # Monkey-patch quant_method with rowwise FP8 GEMM
+            class _FP8RowwiseApply:
+                """FP8 GEMM with per-row activation scales + per-channel weight scales.
 
-            class _FP8Apply:
+                Uses torch._scaled_mm rowwise mode:
+                  scale_a: (M, 1) — dynamic per-row activation scale
+                  scale_b: (1, N) — static per-channel weight scale
+                """
                 @staticmethod
                 def process_weights_after_loading(layer):
                     pass
 
                 @staticmethod
                 def apply(layer, x, bias=None):
-                    x_2d = x.reshape(-1, x.shape[-1])
-                    # Fast static-scale quantization (no abs().max() scan)
-                    x_fp8 = x_2d.to(torch.float8_e4m3fn)
+                    orig_shape = x.shape
+                    x_2d = x.reshape(-1, orig_shape[-1])  # (M, K)
+                    M = x_2d.shape[0]
+
+                    # Dynamic per-row activation quantization
+                    x_float = x_2d.float()
+                    row_amax = x_float.abs().max(dim=1).values.clamp(min=1e-12)  # (M,)
+                    act_scale = (row_amax / 448.0).reshape(M, 1).contiguous()  # (M, 1)
+                    x_fp8 = (x_float / act_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+
+                    # Rowwise FP8 GEMM: (M,K) @ (K,N) with (M,1) and (1,N) scales
                     out = torch._scaled_mm(
-                        x_fp8, layer.weight.t(),
-                        scale_a=_static_act_scale,
+                        x_fp8,
+                        layer.weight.t(),
+                        scale_a=act_scale,
                         scale_b=layer.weight_scale,
                         out_dtype=torch.bfloat16,
                     )
-                    out = out.reshape(*x.shape[:-1], out.shape[-1])
+                    out = out.reshape(*orig_shape[:-1], out.shape[-1])
                     if bias is not None:
                         out = out + bias
                     return out
 
-            module.quant_method = _FP8Apply()
+            module.quant_method = _FP8RowwiseApply()
             n_converted += 1
 
         if n_converted > 0:
             torch.cuda.empty_cache()
             free, total = torch.cuda.mem_get_info()
-            logger.info("Converted %d layers to FP8. Free VRAM: %.1f/%.1f GB",
-                       n_converted, free / 1e9, total / 1e9)
+            logger.info(
+                "Converted %d layers to FP8 (per-channel weights, per-row activations). "
+                "VRAM: %.1f free / %.1f total",
+                n_converted, free / 1e9, total / 1e9,
+            )
+
+        # Clean up
+        self._fp8_weight_data = None
 
     def _load_remapped_weight(
         self,
