@@ -7,25 +7,26 @@ The tiny multiplicative bias at b>=3 is absorbed by softmax normalization
 and subsequent LayerNorm, so attention quality is unaffected.
 
 Algorithm per 128-dim head vector:
-  1. Store L2 norm as FP16, normalize to unit sphere
-  2. Split into two 64-dim halves
+  1. Split into two 64-dim halves
+  2. Store per-half L2 norms as FP16, normalize each half to unit sphere
   3. Apply precomputed random orthogonal rotation (via QR on CPU, seed=42)
   4. Quantize with Lloyd-Max codebooks for N(0, 1/64):
      - High half (dims 0-63):  4-bit MSE (16 centroids) -> 32 bytes packed
      - Low half  (dims 64-127): 3-bit MSE (8 centroids)  -> 24 bytes packed
-  5. Store: 32 + 24 + 2 (norm) = 58 bytes/head  vs 256 bytes BF16  (4.4x)
+  5. Store: 32 + 24 + 2 + 2 (norms) = 60 bytes/head  vs 256 bytes BF16  (4.3x)
 
-Per-token across 36 layers, 8 KV heads, K+V:  32.6 KB  vs  144 KB BF16.
+Per-token across 36 layers, 8 KV heads, K+V:  33.75 KB  vs  144 KB BF16.
 
 Key improvements over previous implementation:
   - No QJL:  eliminates 2 dense 64x64 S^T matmuls per dequant (50% faster)
-  - Per-head L2 norm:  paper requires unit-sphere input (Theorem 1)
+  - Per-half L2 norms:  each 64-d half normalized independently to unit
+    sphere so codebooks scaled for N(0, 1/64) match the actual distribution.
+    (Full-vector norm would give N(0, 1/128) after split — centroids too
+    wide by sqrt(2), wasting outer bins.)
   - torch.bucketize:  O(log k) binary search instead of O(k) argmin
-  - torch.compile on pack/unpack:  fuses ~15 intermediate tensors per call
   - Page deduplication:  torch.unique on page_table avoids dequantizing
-    shared prefix pages multiple times
-  - No pre-allocated temp buffers:  dequantize_pages returns fresh views,
-    eliminating the 2 GB temp_k/temp_v pre-allocation
+    shared prefix tokens multiple times (page_size=1 by default)
+  - Allocator _kvcache updated:  prevents stale reference after pool swap
 """
 
 from __future__ import annotations
@@ -114,9 +115,14 @@ class TurboQuant:
       High (dims 0-63):  4-bit (16 centroids)
       Low  (dims 64-127): 3-bit (8 centroids)
 
-    Each half is independently rotated with a fixed random orthogonal matrix,
-    quantized via binary-search over Lloyd-Max boundaries, and packed.
-    Per-vector L2 norms stored as FP16 for unit-sphere rescaling.
+    Each half is independently normalized to unit sphere (storing its L2
+    norm as FP16), rotated with a fixed random orthogonal matrix, and
+    quantized via binary-search over Lloyd-Max boundaries.
+
+    Per-half normalization is critical: if the full 128-d vector is
+    normalized instead, each 64-d half has expected norm 1/sqrt(2), so
+    rotated coordinates follow N(0, 1/128) not N(0, 1/64).  The codebooks
+    scaled for 1/64 would be sqrt(2) too wide, wasting outer bins.
     """
 
     def __init__(self, device: torch.device, seed: int = 42):
@@ -139,37 +145,48 @@ class TurboQuant:
         self.boundaries_hi = (c4[:-1] + c4[1:]) / 2   # [15]
         self.boundaries_lo = (c3[:-1] + c3[1:]) / 2   # [7]
 
-    def quantize(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def quantize(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Quantize to compressed representation.
 
         Args:
             x: [..., 128] tensor (any float dtype, typically bf16 from attention)
         Returns:
-            packed_hi: [..., 32] uint8   (4-bit indices, dims 0-63)
-            packed_lo: [..., 24] uint8   (3-bit indices, dims 64-127)
-            norms:     [...]    float16  (per-vector L2 norms)
+            packed_hi:  [..., 32] uint8   (4-bit indices, dims 0-63)
+            packed_lo:  [..., 24] uint8   (3-bit indices, dims 64-127)
+            norms_hi:   [...]    float16  (per-half L2 norms, dims 0-63)
+            norms_lo:   [...]    float16  (per-half L2 norms, dims 64-127)
         """
         x = x.float()
-        norms = x.norm(dim=-1)                             # [...]
-        x_normed = x / norms.unsqueeze(-1).clamp(min=1e-8)
+        x_hi = x[..., :64]                                  # [..., 64]
+        x_lo = x[..., 64:]                                   # [..., 64]
 
-        # Rotate each half: coords become ~ N(0, 1/d) by Lemma 1
-        y_hi = x_normed[..., :64] @ self.rot_hi.T         # [..., 64]
-        y_lo = x_normed[..., 64:] @ self.rot_lo.T         # [..., 64]
+        # Per-half normalization to unit sphere (Theorem 1 assumption)
+        norms_hi = x_hi.norm(dim=-1)                         # [...]
+        norms_lo = x_lo.norm(dim=-1)                         # [...]
+        x_hi = x_hi / norms_hi.unsqueeze(-1).clamp(min=1e-8)
+        x_lo = x_lo / norms_lo.unsqueeze(-1).clamp(min=1e-8)
+
+        # Rotate: coords become ~ N(0, 1/d) by Lemma 1 (d=64)
+        y_hi = x_hi @ self.rot_hi.T                          # [..., 64]
+        y_lo = x_lo @ self.rot_lo.T                          # [..., 64]
 
         # Binary-search quantization: O(log k) per element via bucketize
         idx_hi = torch.bucketize(y_hi, self.boundaries_hi)  # [..., 64] in [0,15]
         idx_lo = torch.bucketize(y_lo, self.boundaries_lo)  # [..., 64] in [0,7]
 
-        return _pack_4bit(idx_hi), _pack_3bit(idx_lo), norms.half()
+        return _pack_4bit(idx_hi), _pack_3bit(idx_lo), norms_hi.half(), norms_lo.half()
 
-    def dequantize(self, packed_hi: Tensor, packed_lo: Tensor, norms: Tensor) -> Tensor:
+    def dequantize(
+        self, packed_hi: Tensor, packed_lo: Tensor,
+        norms_hi: Tensor, norms_lo: Tensor,
+    ) -> Tensor:
         """Dequantize compressed representation to BF16.
 
         Args:
-            packed_hi: [..., 32] uint8
-            packed_lo: [..., 24] uint8
-            norms:     [...]    float16
+            packed_hi:  [..., 32] uint8
+            packed_lo:  [..., 24] uint8
+            norms_hi:   [...]    float16
+            norms_lo:   [...]    float16
         Returns:
             x_hat: [..., 128] bfloat16
         """
@@ -182,9 +199,11 @@ class TurboQuant:
         x_hi = y_hi @ self.rot_hi                          # inverse rotation
         x_lo = y_lo @ self.rot_lo
 
-        x = torch.cat([x_hi, x_lo], dim=-1)               # [..., 128]
-        x = x * norms.float().unsqueeze(-1)
-        return x.bfloat16()
+        # Rescale each half by its stored norm
+        x_hi = x_hi * norms_hi.float().unsqueeze(-1)
+        x_lo = x_lo * norms_lo.float().unsqueeze(-1)
+
+        return torch.cat([x_hi, x_lo], dim=-1).bfloat16()  # [..., 128]
 
 
 # ===================================================================
@@ -199,7 +218,7 @@ _ACTIVE_TQ_POOL: Optional["TurboQuantKVPool"] = None
 class TurboQuantKVPool:
     """Compressed KV cache pool using TurboQuant 3.5-bit quantization.
 
-    Storage: 58 bytes/head/token  vs  256 bytes BF16  (4.4x compression).
+    Storage: 60 bytes/head/token  vs  256 bytes BF16  (4.3x compression).
 
     get_kv_buffer() returns empty dummy tensors.  The actual dequantization
     is done by the monkey-patched flash_attn_with_kvcache, which calls
@@ -244,15 +263,17 @@ class TurboQuantKVPool:
         total = size + page_size
 
         # --- Compressed storage: per-layer lists of tensors ---
-        # 4-bit packed:  [total, heads, 32] uint8   (dims 0-63)
-        # 3-bit packed:  [total, heads, 24] uint8   (dims 64-127)
-        # L2 norms:      [total, heads]     float16
+        # 4-bit packed:   [total, heads, 32] uint8   (dims 0-63)
+        # 3-bit packed:   [total, heads, 24] uint8   (dims 64-127)
+        # L2 norms hi/lo: [total, heads]     float16 (per-half norms)
         self.k_packed_hi = [torch.zeros(total, head_num, 32, dtype=torch.uint8, device=device) for _ in range(layer_num)]
         self.k_packed_lo = [torch.zeros(total, head_num, 24, dtype=torch.uint8, device=device) for _ in range(layer_num)]
-        self.k_norms     = [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
+        self.k_norms_hi  = [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
+        self.k_norms_lo  = [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
         self.v_packed_hi = [torch.zeros(total, head_num, 32, dtype=torch.uint8, device=device) for _ in range(layer_num)]
         self.v_packed_lo = [torch.zeros(total, head_num, 24, dtype=torch.uint8, device=device) for _ in range(layer_num)]
-        self.v_norms     = [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
+        self.v_norms_hi  = [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
+        self.v_norms_lo  = [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
 
         # Empty dummy for get_kv_buffer: view(-1, ps, h, d) -> (0, ps, h, d)
         self._dummy = torch.empty(0, dtype=torch.bfloat16, device=device)
@@ -287,15 +308,17 @@ class TurboQuantKVPool:
         li = layer_id - self.start_layer
         self._current_layer_id = layer_id
 
-        k_hi, k_lo, k_n = self.tq.quantize(cache_k)
-        v_hi, v_lo, v_n = self.tq.quantize(cache_v)
+        k_hi, k_lo, k_nh, k_nl = self.tq.quantize(cache_k)
+        v_hi, v_lo, v_nh, v_nl = self.tq.quantize(cache_v)
 
         self.k_packed_hi[li][loc] = k_hi
         self.k_packed_lo[li][loc] = k_lo
-        self.k_norms[li][loc]     = k_n
+        self.k_norms_hi[li][loc]  = k_nh
+        self.k_norms_lo[li][loc]  = k_nl
         self.v_packed_hi[li][loc] = v_hi
         self.v_packed_lo[li][loc] = v_lo
-        self.v_norms[li][loc]     = v_n
+        self.v_norms_hi[li][loc]  = v_nh
+        self.v_norms_lo[li][loc]  = v_nl
 
     def _get_key_buffer(self, layer_id: int):
         return self._dummy
@@ -341,12 +364,14 @@ class TurboQuantKVPool:
         k = self.tq.dequantize(
             self.k_packed_hi[li][locs],
             self.k_packed_lo[li][locs],
-            self.k_norms[li][locs],
+            self.k_norms_hi[li][locs],
+            self.k_norms_lo[li][locs],
         )
         v = self.tq.dequantize(
             self.v_packed_hi[li][locs],
             self.v_packed_lo[li][locs],
-            self.v_norms[li][locs],
+            self.v_norms_hi[li][locs],
+            self.v_norms_lo[li][locs],
         )
 
         return (
@@ -362,16 +387,18 @@ class TurboQuantKVPool:
         for li in range(self.layer_num):
             self.k_packed_hi[li][tgt_loc] = self.k_packed_hi[li][src_loc]
             self.k_packed_lo[li][tgt_loc] = self.k_packed_lo[li][src_loc]
-            self.k_norms[li][tgt_loc]     = self.k_norms[li][src_loc]
+            self.k_norms_hi[li][tgt_loc]  = self.k_norms_hi[li][src_loc]
+            self.k_norms_lo[li][tgt_loc]  = self.k_norms_lo[li][src_loc]
             self.v_packed_hi[li][tgt_loc] = self.v_packed_hi[li][src_loc]
             self.v_packed_lo[li][tgt_loc] = self.v_packed_lo[li][src_loc]
-            self.v_norms[li][tgt_loc]     = self.v_norms[li][src_loc]
+            self.v_norms_hi[li][tgt_loc]  = self.v_norms_hi[li][src_loc]
+            self.v_norms_lo[li][tgt_loc]  = self.v_norms_lo[li][src_loc]
 
     # ---- utility / compat ----
 
     def get_kv_size_bytes(self):
-        k = sum(t.nbytes for ts in (self.k_packed_hi, self.k_packed_lo, self.k_norms) for t in ts)
-        v = sum(t.nbytes for ts in (self.v_packed_hi, self.v_packed_lo, self.v_norms) for t in ts)
+        k = sum(t.nbytes for ts in (self.k_packed_hi, self.k_packed_lo, self.k_norms_hi, self.k_norms_lo) for t in ts)
+        v = sum(t.nbytes for ts in (self.v_packed_hi, self.v_packed_lo, self.v_norms_hi, self.v_norms_lo) for t in ts)
         return k, v
 
     def get_contiguous_buf_infos(self):
@@ -387,8 +414,8 @@ class TurboQuantKVPool:
         self.layer_transfer_counter = counter
 
     def _clear_buffers(self):
-        del self.k_packed_hi, self.k_packed_lo, self.k_norms
-        del self.v_packed_hi, self.v_packed_lo, self.v_norms
+        del self.k_packed_hi, self.k_packed_lo, self.k_norms_hi, self.k_norms_lo
+        del self.v_packed_hi, self.v_packed_lo, self.v_norms_hi, self.v_norms_lo
 
     def maybe_get_custom_mem_pool(self):
         return None
@@ -450,9 +477,14 @@ def inject_turboquant(model_runner):
 
     Called from model_worker.py after SGLModelRunner is instantiated.
     Frees the ~12 GB BF16 pool, creates ~2.7 GB compressed pool,
-    and patches flash_attn_with_kvcache for on-demand page dequantization.
+    patches flash_attn_with_kvcache, and updates the allocator reference.
     """
     global _ACTIVE_TQ_POOL, _orig_flash_attn
+
+    # Guard: don't re-inject if already active
+    if _ACTIVE_TQ_POOL is not None:
+        logger.warning("TurboQuant: already injected, skipping re-injection")
+        return
 
     old_pool = model_runner.token_to_kv_pool
     params = dict(
@@ -490,17 +522,26 @@ def inject_turboquant(model_runner):
     model_runner.token_to_kv_pool = tq_pool
     _ACTIVE_TQ_POOL = tq_pool
 
+    # Update the allocator's cached KV pool reference so it doesn't hold
+    # a stale pointer to the freed BF16 pool.  The allocator stores
+    # _kvcache in BaseTokenToKVPoolAllocator.__init__ (allocator.py:50).
+    allocator = getattr(model_runner, "token_to_kv_pool_allocator", None)
+    if allocator is not None and hasattr(allocator, "_kvcache"):
+        allocator._kvcache = tq_pool
+        logger.info("TurboQuant: updated allocator._kvcache reference")
+
     free_after = torch.cuda.mem_get_info()[0]
     logger.info(
         "TurboQuant: pool created. VRAM free: %.2f GB (net freed: %.2f GB)",
         free_after / 1e9, (free_after - free_before) / 1e9,
     )
 
-    # Monkey-patch flash_attn at both the source module and the backend's
-    # already-imported name binding
+    # Monkey-patch flash_attn.  Guard against double-patching: only capture
+    # _orig_flash_attn if it hasn't been set yet (i.e., first injection).
     import sgl_kernel.flash_attn as _sgl_fa
 
-    _orig_flash_attn = _sgl_fa.flash_attn_with_kvcache
+    if _orig_flash_attn is None:
+        _orig_flash_attn = _sgl_fa.flash_attn_with_kvcache
     _sgl_fa.flash_attn_with_kvcache = _patched_flash_attn
 
     try:
@@ -511,5 +552,5 @@ def inject_turboquant(model_runner):
 
     logger.info(
         "TurboQuant: active. %d slots x %d layers, 3.5 bits/ch, %.1fx compression",
-        params["size"], params["layer_num"], 256.0 / 58.0,
+        params["size"], params["layer_num"], 256.0 / 60.0,
     )
