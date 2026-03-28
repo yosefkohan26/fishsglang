@@ -114,6 +114,12 @@ class ModelWorker:
             weight_prefix=self.weight_prefix,
         )
 
+        try:
+            from .turboquant import inject_turboquant
+            inject_turboquant(self.model_runner)
+        except Exception as e:
+            logger.error(f"Failed to inject TurboQuant: {e}")
+
     def forward_batch_generation(
         self,
         forward_batch,
