@@ -2,6 +2,8 @@
 """TTFA benchmark for S2-Pro streaming TTS.
 
 Measures Time to First Audio across concurrency levels with voice cloning.
+Voices are pre-encoded (codes.pt in voices/<name>/), no runtime encoding needed.
+
 Each run creates a folder under benchmark_runs/ with:
   - results.csv (appended globally to benchmark_results.csv too)
   - WAV files for every request at every concurrency level
@@ -9,13 +11,8 @@ Each run creates a folder under benchmark_runs/ with:
 
 Usage:
     python benchmark_ttfa.py -d "baseline BF16 no optimizations"
-    python benchmark_ttfa.py -d "FP8 KV cache" --no-voice
-    python benchmark_ttfa.py -d "quick test" --concurrencies 1 2 4
-
-Requirements:
-    - Server must be running on --port (default 8000)
-    - For voice tests: benchmark_audio/reference.wav and reference.txt must exist
-    - git add and commit your changes BEFORE running (enforced by default)
+    python benchmark_ttfa.py -d "flush fix" --concurrencies 1 4 8
+    python benchmark_ttfa.py -d "no voice" --no-voice
 """
 
 from __future__ import annotations
@@ -44,9 +41,6 @@ DEFAULT_PORT = 8000
 DEFAULT_CSV = "benchmark_results.csv"
 RUNS_DIR = "benchmark_runs"
 DEFAULT_CONCURRENCIES = [1, 2, 4, 8, 16, 32, 64]
-WARMUP_ROUNDS = 3
-REF_AUDIO = "benchmark_audio/reference.wav"
-REF_TEXT_FILE = "benchmark_audio/reference.txt"
 
 # ~10s of speech — intentionally different from reference audio to test
 # novel content generation, not parroting. Keep consistent across runs.
@@ -238,39 +232,19 @@ async def run_concurrency(
     return stats, results
 
 
-async def warmup(
-    url: str, text: str, voice_id: str | None,
-    ref_audio: str | None, ref_text: str | None, rounds: int = 3,
-) -> None:
-    """Warm up voice cache, semantic LUT, and RadixCache."""
-    print("Warming up", end="", flush=True)
-
-    if voice_id and ref_audio and os.path.exists(ref_audio):
-        payload: dict = {
-            "input": "Hello warmup.", "voice_id": voice_id,
-            "ref_audio": ref_audio, "stream": True,
-        }
-        if ref_text:
-            payload["ref_text"] = ref_text
-        with httpx.stream(
+async def warmup(url: str, text: str, voice_id: str | None) -> None:
+    """Single warmup request to prime RadixCache prefix."""
+    print("Warming up...", end=" ", flush=True)
+    payload: dict = {"input": "Warmup test.", "stream": True}
+    if voice_id:
+        payload["voice_id"] = voice_id
+    async with httpx.AsyncClient() as client:
+        async with client.stream(
             "POST", f"{url}/v1/audio/speech", json=payload, timeout=120,
         ) as r:
-            for _ in r.iter_lines():
+            async for _ in r.aiter_lines():
                 pass
-        print(".", end="", flush=True)
-
-    for _ in range(rounds):
-        payload = {"input": text, "stream": True}
-        if voice_id:
-            payload["voice_id"] = voice_id
-        with httpx.stream(
-            "POST", f"{url}/v1/audio/speech", json=payload, timeout=60,
-        ) as r:
-            for _ in r.iter_lines():
-                pass
-        print(".", end="", flush=True)
-
-    print(" done")
+    print("done")
 
 
 # ---------------------------------------------------------------------------
@@ -312,8 +286,7 @@ async def main() -> None:
     )
     parser.add_argument("--no-voice", action="store_true")
     parser.add_argument("--text", default=DEFAULT_TEXT)
-    parser.add_argument("--voice-id", default="joseph")
-    parser.add_argument("--warmup-rounds", type=int, default=WARMUP_ROUNDS)
+    parser.add_argument("--voice-id", default="jackson")
     parser.add_argument("--allow-dirty", action="store_true")
     args = parser.parse_args()
 
@@ -360,6 +333,7 @@ async def main() -> None:
     print(f"  Git message:    {git_message}")
     print(f"  GPU:            {gpu}")
     print(f"  Voice cloning:  {voice_cloning}")
+    print(f"  Voice ID:       {voice_id}")
     print(f"  Concurrencies:  {args.concurrencies}")
     print(f"  Run directory:  {run_dir}")
     print(f"  CSV output:     {args.csv}")
@@ -380,17 +354,8 @@ async def main() -> None:
     with open(os.path.join(run_dir, "run_info.json"), "w") as f:
         json.dump(run_info, f, indent=2)
 
-    # Load ref text
-    ref_text = None
-    if os.path.exists(REF_TEXT_FILE):
-        ref_text = open(REF_TEXT_FILE).read().strip()
-    ref_audio_path = REF_AUDIO if os.path.exists(REF_AUDIO) else None
-
-    # Warmup
-    await warmup(
-        url, args.text, voice_id, ref_audio_path, ref_text,
-        rounds=args.warmup_rounds,
-    )
+    # Warmup: single request to prime RadixCache
+    await warmup(url, args.text, voice_id)
 
     # Run benchmarks
     header = (

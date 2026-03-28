@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Callable
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from sglang_omni.engines.base import Engine
 from sglang_omni.executors.interface import Executor
@@ -142,7 +145,10 @@ class EngineExecutor(Executor):
         flush_stream = getattr(self._stream_builder, "flush", None)
         if request_id in self._aborted or not callable(flush_stream):
             return
+        import asyncio as _asyncio
         chunk = flush_stream(payload)
+        if _asyncio.iscoroutine(chunk):
+            chunk = await chunk
         if chunk is not None:
             yield chunk
 

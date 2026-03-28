@@ -48,11 +48,16 @@ class ModelRunner:
 
     def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         """Execute model inference for given scheduler output."""
+        import time as _time
+
         if scheduler_output.num_requests == 0:
             return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
 
+        t0 = _time.perf_counter()
+
         # 1. Prepare inputs (model-specific via InputPreparer)
         model_inputs = self.input_preparer.prepare(scheduler_output, self.device)
+        t1 = _time.perf_counter()
 
         # 2. Forward pass
         if isinstance(model_inputs, dict) and model_inputs.get("_skip_all"):
@@ -60,11 +65,26 @@ class ModelRunner:
         else:
             with torch.inference_mode():
                 model_output = self.model(**model_inputs)
+        t2 = _time.perf_counter()
 
         # 3. Process outputs (model-specific via OutputProcessor)
         outputs: dict[str, RequestOutput] = self.output_processor.process(
             model_output, scheduler_output
         )
+        t3 = _time.perf_counter()
+
+        # Log every step for first few, then every 50th
+        n_reqs = scheduler_output.num_requests
+        step_id = getattr(self, '_step_count', 0)
+        self._step_count = step_id + 1
+        if step_id < 5 or step_id % 50 == 0:
+            logger.info(
+                "[PROFILE] execute step=%d reqs=%d prepare=%.2fms forward=%.2fms "
+                "process=%.2fms total=%.2fms",
+                step_id, n_reqs,
+                (t1 - t0) * 1000, (t2 - t1) * 1000,
+                (t3 - t2) * 1000, (t3 - t0) * 1000,
+            )
 
         # 4. Build metadata
         req_ids = [req.request_id for req in scheduler_output.requests]

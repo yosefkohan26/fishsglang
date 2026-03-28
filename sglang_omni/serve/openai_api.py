@@ -17,6 +17,8 @@ import json
 import logging
 import time
 import uuid
+
+logger = logging.getLogger(__name__)
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -475,6 +477,7 @@ async def _speech_stream(
     speed: float,
 ):
     """Streaming speech generator (yields SSE events with audio chunks)."""
+
     chunk_index = 0
     emitted_samples = 0
     finish_reason: str | None = None

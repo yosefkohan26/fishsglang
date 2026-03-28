@@ -281,6 +281,25 @@ class S2ProSGLangTextModel(nn.Module):
             max_batch_size, dtype=torch.long, device=device
         )
 
+        # Per-request sampling buffers (updated by ModelRunner before each step)
+        self._sampling_temperature = torch.full(
+            (max_batch_size,), 0.8, device=device, dtype=torch.float32
+        )
+        self._sampling_top_p = torch.full(
+            (max_batch_size,), 0.8, device=device, dtype=torch.float32
+        )
+        self._sampling_top_k = 30
+        self._sampling_rep_penalty = torch.full(
+            (max_batch_size,), 1.1, device=device, dtype=torch.float32
+        )
+        # Ring buffer of recent semantic tokens for repetition penalty (last 16)
+        self._prev_tokens = torch.zeros(
+            max_batch_size, 16, dtype=torch.long, device=device
+        )
+        self._prev_tokens_len = torch.zeros(
+            max_batch_size, dtype=torch.long, device=device
+        )
+
         self._vq_ready = True
 
     # ------------------------------------------------------------------
@@ -346,17 +365,79 @@ class S2ProSGLangTextModel(nn.Module):
 
     @torch.no_grad()
     def _decode_codebooks(self, logits: Tensor, hidden_states: Tensor) -> None:
-        """Constrained semantic sampling + batched codebook generation."""
+        """Constrained semantic sampling + batched codebook generation.
+
+        Matches the sampling behaviour of S2ProSGLangOutputProcessor._two_stage_decode:
+        1. BF16 logit alignment (BEFORE bias — matches training numerics)
+        2. Semantic bias (constrain to semantic tokens + EOS)
+        3. Per-request repetition penalty on last-16 tokens
+        4. RAS: if last-4 tokens contain duplicates, boost temperature/top_p
+        5. Top-k → Top-p → Temperature → Multinomial sampling
+        """
         bs = logits.shape[0]
 
-        # Constrained decode: mask non-semantic tokens
-        biased_logits = logits + self._semantic_bias
-        semantic_token = torch.argmax(biased_logits, dim=-1)  # [bs]
+        # 1. BF16 alignment FIRST (match fish-speech training numerics)
+        aligned_logits = logits.to(torch.bfloat16).to(torch.float32)
 
-        # Batched codebook loop
+        # 2. Semantic bias (constrain vocabulary)
+        aligned_logits = aligned_logits + self._semantic_bias.float()
+
+        # Per-request sampling
+        for i in range(bs):
+            row = aligned_logits[i : i + 1]  # [1, vocab]
+            n_prev = int(self._prev_tokens_len[i].item())
+
+            # 3. Repetition penalty
+            if n_prev > 0:
+                prev = self._prev_tokens[i, :n_prev].unsqueeze(0)
+                score = torch.gather(row, dim=-1, index=prev)
+                rep_p = self._sampling_rep_penalty[i]
+                score = torch.where(score < 0, score * rep_p, score / rep_p)
+                row = row.clone()
+                row.scatter_(dim=-1, index=prev, src=score)
+
+            # 4. RAS: detect repetition in last 4 tokens → boost diversity
+            temperature = self._sampling_temperature[i]
+            top_p = self._sampling_top_p[i]
+            if n_prev >= 4:
+                last4 = self._prev_tokens[i, max(0, n_prev - 4) : n_prev].tolist()
+                if len(set(last4)) < len(last4):
+                    temperature = torch.tensor(1.5, device=row.device)
+                    top_p = torch.tensor(0.95, device=row.device)
+
+            # 5. Top-k
+            top_k = self._sampling_top_k
+            if top_k > 0:
+                tk_vals, tk_idx = torch.topk(
+                    row, min(top_k, row.size(-1)), dim=-1
+                )
+                row = torch.full_like(row, -float("inf"))
+                row.scatter_(dim=-1, index=tk_idx, src=tk_vals)
+
+            # 6. Top-p
+            sorted_logits, sorted_idx = torch.sort(row, descending=True)
+            cum_probs = torch.cumsum(
+                torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1
+            )
+            mask = cum_probs > top_p
+            mask[..., 0] = False
+            remove = mask.scatter(dim=-1, index=sorted_idx, src=mask)
+            row = row.masked_fill(remove, -float("inf"))
+
+            # 7. Temperature + multinomial
+            row = row / torch.clamp(temperature, min=1e-5)
+            probs = torch.nn.functional.softmax(row, dim=-1)
+            token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            self._output_semantic_ids[i] = token.item()
+
+
+
+        semantic_token = self._output_semantic_ids[:bs]
+
+        # Batched codebook loop (fast AR)
         self._audio_decoder.reset_caches()
         fast_input = self._audio_decoder.project_in(hidden_states)
-        fast_input = fast_input.unsqueeze(1)  # [bs, 1, fast_dim]
+        fast_input = fast_input.unsqueeze(1)
         self._audio_decoder.forward_kvcached(fast_input, codebook_idx=0)
 
         sem_id = (semantic_token - self._semantic_begin_id).clamp(min=0)
@@ -370,11 +451,9 @@ class S2ProSGLangTextModel(nn.Module):
                 cb_hidden, codebook_idx=cb_idx
             )
             cb_logits = cb_logits[:, 0, : self._codebook_size]
-            cb_token = torch.argmax(cb_logits, dim=-1)  # [bs]
+            cb_token = torch.argmax(cb_logits, dim=-1)
             cb_hidden = self._audio_decoder.embeddings(cb_token).unsqueeze(1)
             self._output_codes[:bs, cb_idx + 1] = cb_token
-
-        self._output_semantic_ids[:bs] = semantic_token
 
     # ------------------------------------------------------------------
     # Helpers
@@ -384,15 +463,53 @@ class S2ProSGLangTextModel(nn.Module):
         return self.embed_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str, Tensor]]):
-        """Load weights from fish_speech FishQwen3OmniForCausalLM checkpoint."""
+        """Load weights from fish_speech FishQwen3OmniForCausalLM checkpoint.
+
+        Supports INT4/INT8 quantized checkpoints: collects .qweight/.scales/.qzeros
+        triplets, dequantizes to BF16, then loads as normal weights.
+        """
         params_dict = dict(self.named_parameters())
 
-        for name, loaded_weight in weights:
-            if name.startswith("text_model.model."):
-                name = name[len("text_model.model.") :]
-            else:
-                continue
+        # First pass: collect all weights, buffering quantized components
+        quant_buf: dict[str, dict[str, Tensor]] = {}  # base_name → {suffix → tensor}
+        normal_weights: list[Tuple[str, Tensor]] = []
 
+        for name, loaded_weight in weights:
+            if not name.startswith("text_model.model."):
+                continue
+            name = name[len("text_model.model."):]
+
+            # Detect quantized weight components
+            for suffix in (".qweight", ".scales", ".qzeros", ".awq_scales"):
+                if name.endswith(suffix):
+                    base = name[:-len(suffix)]
+                    quant_buf.setdefault(base, {})[suffix] = loaded_weight
+                    break
+            else:
+                normal_weights.append((name, loaded_weight))
+
+        # Dequantize buffered quantized weights
+        if quant_buf:
+            logger.info("Dequantizing %d quantized weight matrices in load_weights…", len(quant_buf))
+            for base, parts in quant_buf.items():
+                qw = parts.get(".qweight")
+                sc = parts.get(".scales")
+                if qw is None or sc is None:
+                    continue
+                qz = parts.get(".qzeros")
+                if qz is not None:
+                    # INT4 group quantization
+                    from sglang_omni.models.weight_loader import _dequantize_int4
+                    awq_sc = parts.get(".awq_scales")
+                    w = _dequantize_int4(qw, sc, qz, group_size=128, awq_scales=awq_sc)
+                else:
+                    # INT8 per-channel symmetric
+                    w = (qw.float() * sc.float().unsqueeze(1)).bfloat16()
+                # base is e.g. "layers.0.attention.wqkv.weight"
+                normal_weights.append((base, w))
+
+        # Now load all (dequantized + original) weights
+        for name, loaded_weight in normal_weights:
             if self._load_remapped_weight(name, loaded_weight, params_dict):
                 continue
 

@@ -13,14 +13,25 @@ from sglang_omni.models.fishaudio_s2_pro.runtime.s2pro_sglang_ar import (
 )
 
 
+import logging as _logging
+
+_engine_io_logger = _logging.getLogger(__name__)
+
+
 def build_sglang_tts_request(
     state: S2ProState, tokenizer: Any, *, request_id: str = ""
 ) -> S2ProSGLangRequestData:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.sampling.sampling_params import SamplingParams
 
-    input_ids_list = list(state.input_ids)
+    input_ids_list = state.input_ids.tolist() if hasattr(state.input_ids, 'tolist') else list(state.input_ids)
     input_ids = torch.tensor(input_ids_list, dtype=torch.long)
+
+    _engine_io_logger.info(
+        "[RADIX-DEBUG] req=%s n_tokens=%d first20=%s last10=%s",
+        request_id[:24], len(input_ids_list),
+        input_ids_list[:20], input_ids_list[-10:],
+    )
 
     vq_mask_tokens = state.vq_mask_tokens
     if vq_mask_tokens is not None:

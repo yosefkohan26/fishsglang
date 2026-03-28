@@ -61,13 +61,53 @@ def _read_safetensors_keys(path: Path, keys: list[str]) -> dict[str, torch.Tenso
     return state_dict
 
 
+def _dequantize_int4(qweight: torch.Tensor, scales: torch.Tensor,
+                     qzeros: torch.Tensor, group_size: int = 128,
+                     awq_scales: torch.Tensor | None = None) -> torch.Tensor:
+    """Dequantize INT4 packed weights back to FP16."""
+    out_features = qweight.shape[0]
+    packed_in = qweight.shape[1]
+    in_features = packed_in * 8
+
+    w_unpacked = torch.zeros(out_features, in_features, dtype=torch.int32)
+    for i in range(8):
+        w_unpacked[:, i::8] = (qweight >> (i * 4)) & 0xF
+
+    n_groups = qzeros.shape[0]
+    packed_out = qzeros.shape[1]
+    zp_unpacked = torch.zeros(n_groups, packed_out * 8, dtype=torch.int32)
+    for i in range(8):
+        zp_unpacked[:, i::8] = (qzeros >> (i * 4)) & 0xF
+    zp_unpacked = zp_unpacked[:, :out_features]
+
+    w_grouped = w_unpacked.reshape(out_features, n_groups, group_size).float()
+    zp = zp_unpacked.transpose(0, 1).unsqueeze(-1).float()
+    sc = scales.transpose(0, 1).unsqueeze(-1).float()
+
+    w_dequant = (w_grouped - zp) * sc
+    w_dequant = w_dequant.reshape(out_features, in_features)
+
+    if awq_scales is not None:
+        w_dequant = w_dequant / awq_scales.float().unsqueeze(0)
+
+    return w_dequant.bfloat16()
+
+
 def _load_safetensors_sharded(model_path: Path, prefix: str) -> dict[str, torch.Tensor]:
     index_file = model_path / "model.safetensors.index.json"
     if not index_file.exists():
         return {}
 
     with index_file.open("r", encoding="utf-8") as f:
-        weight_map = json.load(f)["weight_map"]
+        index_data = json.load(f)
+    weight_map = index_data["weight_map"]
+
+    # Detect quantization from metadata or key patterns
+    metadata = index_data.get("metadata", {})
+    is_quantized = metadata.get("quantization") in ("gptq-int4", "awq-int4")
+    if not is_quantized:
+        is_quantized = any(k.endswith(".qweight") for k in weight_map)
+    group_size = int(metadata.get("group_size", 128))
 
     shards: dict[str, list[str]] = {}
     for key, shard in weight_map.items():
@@ -75,12 +115,69 @@ def _load_safetensors_sharded(model_path: Path, prefix: str) -> dict[str, torch.
             shards.setdefault(shard, []).append(key)
 
     state_dict: dict[str, torch.Tensor] = {}
+
+    if not is_quantized:
+        for shard, keys in shards.items():
+            shard_path = model_path / shard
+            shard_weights = _read_safetensors_keys(shard_path, keys)
+            for key, tensor in shard_weights.items():
+                new_key = key[len(prefix):]
+                state_dict[new_key] = tensor
+        return state_dict
+
+    # Quantized path: dequantize .qweight/.scales/.qzeros → .weight
+    import logging
+    logger = logging.getLogger(__name__)
+    quant_type = metadata.get("quantization", "int4")
+    bits = int(metadata.get("bits", 4))
+    logger.info("Detected %s quantized weights (bits=%d, group_size=%d), dequantizing…",
+                quant_type, bits, group_size)
+
     for shard, keys in shards.items():
         shard_path = model_path / shard
         shard_weights = _read_safetensors_keys(shard_path, keys)
-        for key, tensor in shard_weights.items():
-            new_key = key[len(prefix) :]
-            state_dict[new_key] = tensor
+
+        # Group quantized weight sets
+        qweight_bases = {
+            k[len(prefix):-len(".qweight")]
+            for k in keys if k.endswith(".qweight")
+        }
+        loaded_keys: set[str] = set()
+
+        for base in qweight_bases:
+            full_base = prefix + base
+            qw = shard_weights.get(full_base + ".qweight")
+            sc = shard_weights.get(full_base + ".scales")
+            if qw is None or sc is None:
+                continue
+
+            qz = shard_weights.get(full_base + ".qzeros")
+
+            if qz is not None:
+                # INT4 group quantization (asymmetric, packed)
+                awq_sc = shard_weights.get(full_base + ".awq_scales")
+                w = _dequantize_int4(qw, sc, qz, group_size, awq_sc)
+                loaded_keys.add(full_base + ".qzeros")
+                if awq_sc is not None:
+                    loaded_keys.add(full_base + ".awq_scales")
+            else:
+                # INT8 per-channel symmetric quantization
+                w = (qw.float() * sc.float().unsqueeze(1)).bfloat16()
+
+            # base already ends with ".weight" (e.g. "layers.0.attention.wqkv.weight")
+            state_dict[base] = w
+
+            loaded_keys.add(full_base + ".qweight")
+            loaded_keys.add(full_base + ".scales")
+
+        # Load non-quantized weights
+        for key in keys:
+            if key not in loaded_keys:
+                new_key = key[len(prefix):]
+                state_dict[new_key] = shard_weights[key]
+
+    logger.info("Dequantized %d weight matrices, %d total tensors",
+                len([k for k in state_dict if '.weight' in k]), len(state_dict))
     return state_dict
 
 

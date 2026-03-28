@@ -395,6 +395,7 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
         return indices.cpu()
 
     def _preprocess(payload: StagePayload) -> StagePayload:
+        t0 = time.perf_counter()
         inputs = payload.request.inputs or {}
         params = payload.request.params or {}
 
@@ -413,13 +414,17 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
 
         # Check voice cache first — skip encoding entirely if cached
         prompt_data = None
+        cache_hit = False
         if voice_id and not raw_refs:
             cached = get_cached_voice(voice_id)
             if cached is not None:
+                cache_hit = True
                 logger.debug("Voice cache hit for voice_id=%s", voice_id)
                 references = [
                     Reference(audio_bytes=b"", text=cached.ref_text, vq_codes=cached.vq_codes)
                 ]
+
+        t_cache = time.perf_counter()
 
         if references is None and raw_refs:
             references = []
@@ -429,7 +434,10 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
                     vq_codes = torch.tensor(vq_codes)
 
                 if vq_codes is None and ref_data.get("audio_path"):
+                    t_enc0 = time.perf_counter()
                     vq_codes = _encode_reference_audio(ref_data["audio_path"])
+                    t_enc1 = time.perf_counter()
+                    logger.info("[PROFILE] ref_audio_encode: %.1fms", (t_enc1 - t_enc0) * 1000)
 
                 ref_text = ref_data.get("text", "")
                 references.append(
@@ -445,6 +453,8 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
                     put_cached_voice(voice_id, vq_codes, ref_text)
                     logger.info("Cached voice_id=%s (%d tokens)", voice_id, vq_codes.shape[-1])
 
+        t_refs = time.perf_counter()
+
         if prompt_data is None:
             prompt_data = adapter.build_prompt(
                 text=text,
@@ -452,19 +462,80 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
                 num_codebooks=num_codebooks,
             )
 
+        t_prompt = time.perf_counter()
+
         state = S2ProState(
             input_ids=prompt_data["input_ids"],
             vq_mask_tokens=prompt_data["vq_mask_tokens"],
             vq_parts=prompt_data["vq_parts"],
             num_codebooks=num_codebooks,
             codebook_size=codebook_size,
-            max_new_tokens=params.get("max_new_tokens", 1024),
+            max_new_tokens=params.get("max_new_tokens", 2048),
             temperature=params.get("temperature", 0.8),
             top_p=params.get("top_p", 0.8),
             top_k=params.get("top_k", 30),
             repetition_penalty=params.get("repetition_penalty", 1.1),
         )
+
         return store_state(payload, state)
+
+    # ------------------------------------------------------------------
+    # Pre-load voices from voices/ directory at startup
+    #
+    # Each voice folder can contain:
+    #   audio.wav  + transcript.txt   → encoded on first run, cached as codes.pt
+    #   codes.pt   + transcript.txt   → loaded instantly (no codec needed)
+    # ------------------------------------------------------------------
+    # Look for voices/ relative to the working directory (project root)
+    voices_dir = os.path.join(os.getcwd(), "voices")
+    if os.path.isdir(voices_dir):
+        logger.info("Pre-loading voices from %s …", voices_dir)
+        for voice_name in sorted(os.listdir(voices_dir)):
+            voice_path = os.path.join(voices_dir, voice_name)
+            if not os.path.isdir(voice_path):
+                continue
+
+            transcript_file = os.path.join(voice_path, "transcript.txt")
+            ref_text = ""
+            if os.path.exists(transcript_file):
+                with open(transcript_file, "r") as f:
+                    ref_text = f.read().strip()
+
+            codes_file = os.path.join(voice_path, "codes.pt")
+            t_start = time.perf_counter()
+
+            try:
+                if os.path.exists(codes_file):
+                    # Fast path: load pre-encoded VQ codes (~1ms)
+                    vq_codes = torch.load(codes_file, map_location="cpu", weights_only=True)
+                    put_cached_voice(voice_name, vq_codes, ref_text)
+                    elapsed = time.perf_counter() - t_start
+                    logger.info(
+                        "  Loaded voice '%s' from codes.pt in %.0fms (%d VQ frames)",
+                        voice_name, elapsed * 1000, vq_codes.shape[-1],
+                    )
+                else:
+                    # Slow path: encode audio → save codes.pt for next time
+                    audio_file = None
+                    for ext in ("wav", "mp3", "flac", "ogg"):
+                        candidate = os.path.join(voice_path, f"audio.{ext}")
+                        if os.path.exists(candidate):
+                            audio_file = candidate
+                            break
+                    if audio_file is None:
+                        continue
+                    vq_codes = _encode_reference_audio(audio_file)
+                    put_cached_voice(voice_name, vq_codes, ref_text)
+                    torch.save(vq_codes, codes_file)
+                    elapsed = time.perf_counter() - t_start
+                    logger.info(
+                        "  Encoded voice '%s' in %.1fs (%d VQ frames) → saved codes.pt",
+                        voice_name, elapsed, vq_codes.shape[-1],
+                    )
+            except Exception as e:
+                logger.warning("  Failed to load voice '%s': %s", voice_name, e)
+    else:
+        logger.info("No voices/ directory found at %s, skipping preload", voices_dir)
 
     return PreprocessingExecutor(_preprocess)
 
@@ -479,7 +550,7 @@ def create_sglang_tts_engine_executor(
     stream_followup_stride: int = 50,
     stream_left_context: int = 25,
     stream_vocoder_device: str | None = None,
-    batch_window_ms: float = 0.0,
+    batch_window_ms: float = 2.0,
 ) -> EngineExecutor:
     """Factory for the S2-Pro TTS engine stage."""
     from sglang.srt.server_args import ServerArgs
@@ -505,6 +576,19 @@ def create_sglang_tts_engine_executor(
     _total_upsample = _warmup_codec(
         _stream_codec, num_codebooks=num_codebooks, device=stream_vocoder_device
     )
+
+    # torch.compile the codec decoder for faster vocoding (~2x speedup).
+    # The DAC decoder is purely convolutional + snake activations, which
+    # TorchInductor fuses very well.
+    if stream_vocoder_device != "cpu":
+        try:
+            _stream_codec.from_indices = torch.compile(
+                _stream_codec.from_indices, mode="reduce-overhead"
+            )
+            logger.info("torch.compiled stream codec from_indices")
+        except Exception as e:
+            logger.warning("torch.compile on stream codec failed, using eager: %s", e)
+
     def _get_stream_codec() -> tuple[Any, int]:
         return _stream_codec, _total_upsample
 
@@ -513,10 +597,12 @@ def create_sglang_tts_engine_executor(
         model_path=checkpoint_dir,
         tp_size=1,
         dtype="bfloat16",
+        # attention_backend not set — SGLang auto-selects (flashinfer on Ada, fa3 on Hopper)
+        # kv_cache_dtype="fp8_e4m3",  # disabled: causes early EOS without calibrated scales
         mem_fraction_static=0.85,
         chunked_prefill_size=8192,
-        max_running_requests=64,
-        disable_cuda_graph=False,
+        max_running_requests=48,
+        disable_cuda_graph=True,
     )
 
     engine = create_s2pro_sglang_engine(
@@ -587,6 +673,7 @@ def create_sglang_tts_engine_executor(
         if abs_tokens < next_vocode:
             return None
 
+        _t_vocode_start = time.perf_counter()
         # ── Prepare vocode inputs (event loop, fast) ──
         codec, upsample = _get_stream_codec()
         base_offset = int(payload.data.get("_stream_base_offset", 0))
@@ -617,9 +704,15 @@ def create_sglang_tts_engine_executor(
         trim_samples = ctx * upsample
 
         # ── Slow path: vocode in thread (engine keeps generating) ──
+        _vocode_count = payload.data.get("_vocode_count", 0)
+        payload.data["_vocode_count"] = _vocode_count + 1
+        _vc = _vocode_count
+
         def _vocode() -> dict[str, Any] | None:
+            t_v0 = time.perf_counter()
             with torch.no_grad():
                 audio = codec.from_indices(codebook_input[None])
+            t_v1 = time.perf_counter()
             audio_flat = audio[0, 0].float().cpu()
             if trim_samples >= audio_flat.shape[-1]:
                 return None
@@ -630,6 +723,16 @@ def create_sglang_tts_engine_executor(
             )
             if delta.numel() == 0:
                 return None
+            t_v2 = time.perf_counter()
+            if _vc < 3:  # Only log first 3 vocode calls
+                logger.info(
+                    "[PROFILE] vocode[%d] codec=%.1fms postproc=%.1fms total=%.1fms samples=%d",
+                    _vc,
+                    (t_v1 - t_v0) * 1000,
+                    (t_v2 - t_v1) * 1000,
+                    (t_v2 - t_v0) * 1000,
+                    delta.numel(),
+                )
             # Raw bytes: ~8 KB vs .tolist() creating thousands of Python floats
             return {
                 "audio_waveform": delta.numpy().tobytes(),
@@ -639,14 +742,20 @@ def create_sglang_tts_engine_executor(
                 "modality": "audio",
             }
 
-        return await asyncio.to_thread(_vocode)
+        result = await asyncio.to_thread(_vocode)
+        if _vc < 3:
+            logger.info("[TRACE] vocode[%d] total_wall=%.1fms (includes thread dispatch)", _vc, (time.perf_counter() - _t_vocode_start) * 1000)
+        return result
 
-    def _flush_stream(payload: StagePayload | None) -> dict[str, Any] | None:
+    async def _flush_stream(payload: StagePayload | None):
         """Flush remaining un-vocoded tokens when the stream ends.
 
         Called by EngineExecutor after the last stream item. Without this,
         tokens accumulated after the last periodic vocode are lost — causing
         audio to be cut off at the end.
+
+        Async so the vocode runs in the thread pool where torch.compile's
+        CUDA graph TLS is available (same pool as _stream_builder).
         """
         if payload is None or not isinstance(payload.data, dict):
             return None
@@ -679,26 +788,32 @@ def create_sglang_tts_engine_executor(
 
         trim_samples = max(ctx, 0) * upsample
         sample_rate = codec.sample_rate
+        remaining = abs_total - prev_end
 
-        with torch.no_grad():
-            audio = codec.from_indices(codebook_input[None])
-        audio_flat = audio[0, 0].float().cpu()
-        if trim_samples >= audio_flat.shape[-1]:
-            return None
-        delta = (
-            audio_flat[trim_samples:].contiguous()
-            if trim_samples > 0
-            else audio_flat.contiguous()
-        )
-        if delta.numel() == 0:
-            return None
-        return {
-            "audio_waveform": delta.numpy().tobytes(),
-            "audio_waveform_shape": list(delta.shape),
-            "audio_waveform_dtype": "float32",
-            "sample_rate": sample_rate,
-            "modality": "audio",
-        }
+        def _vocode_flush():
+            with torch.no_grad():
+                audio = codec.from_indices(codebook_input[None])
+            audio_flat = audio[0, 0].float().cpu()
+            if trim_samples >= audio_flat.shape[-1]:
+                return None
+            delta = (
+                audio_flat[trim_samples:].contiguous()
+                if trim_samples > 0
+                else audio_flat.contiguous()
+            )
+            if delta.numel() == 0:
+                return None
+            logger.info("[FLUSH] vocoded %d remaining tokens → %d samples (%.2fs)",
+                         remaining, delta.numel(), delta.numel() / sample_rate)
+            return {
+                "audio_waveform": delta.numpy().tobytes(),
+                "audio_waveform_shape": list(delta.shape),
+                "audio_waveform_dtype": "float32",
+                "sample_rate": sample_rate,
+                "modality": "audio",
+            }
+
+        return await asyncio.to_thread(_vocode_flush)
 
     # Attach flush so EngineExecutor calls it after the last stream item
     _stream_builder.flush = _flush_stream  # type: ignore[attr-defined]
