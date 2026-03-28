@@ -605,7 +605,7 @@ def create_sglang_tts_engine_executor(
         model_path=checkpoint_dir,
         tp_size=1,
         dtype="bfloat16",
-        # attention_backend not set — SGLang auto-selects (flashinfer on Ada, fa3 on Hopper)
+        attention_backend="fa3",  # Must match training; flashinfer causes dynamo conflicts
         # kv_cache_dtype="fp8_e4m3",  # disabled: causes early EOS without calibrated scales
         mem_fraction_static=0.85,
         chunked_prefill_size=8192,
@@ -681,7 +681,6 @@ def create_sglang_tts_engine_executor(
         if abs_tokens < next_vocode:
             return None
 
-        _t_vocode_start = time.perf_counter()
         # ── Prepare vocode inputs (event loop, fast) ──
         codec, upsample = _get_stream_codec()
         base_offset = int(payload.data.get("_stream_base_offset", 0))
@@ -712,15 +711,9 @@ def create_sglang_tts_engine_executor(
         trim_samples = ctx * upsample
 
         # ── Slow path: vocode in thread (engine keeps generating) ──
-        _vocode_count = payload.data.get("_vocode_count", 0)
-        payload.data["_vocode_count"] = _vocode_count + 1
-        _vc = _vocode_count
-
         def _vocode() -> dict[str, Any] | None:
-            t_v0 = time.perf_counter()
             with torch.no_grad():
                 audio = codec.from_indices(codebook_input[None])
-            t_v1 = time.perf_counter()
             audio_flat = audio[0, 0].float().cpu()
             if trim_samples >= audio_flat.shape[-1]:
                 return None
@@ -731,17 +724,6 @@ def create_sglang_tts_engine_executor(
             )
             if delta.numel() == 0:
                 return None
-            t_v2 = time.perf_counter()
-            if _vc < 3:  # Only log first 3 vocode calls
-                logger.info(
-                    "[PROFILE] vocode[%d] codec=%.1fms postproc=%.1fms total=%.1fms samples=%d",
-                    _vc,
-                    (t_v1 - t_v0) * 1000,
-                    (t_v2 - t_v1) * 1000,
-                    (t_v2 - t_v0) * 1000,
-                    delta.numel(),
-                )
-            # Raw bytes: ~8 KB vs .tolist() creating thousands of Python floats
             return {
                 "audio_waveform": delta.numpy().tobytes(),
                 "audio_waveform_shape": list(delta.shape),
@@ -750,10 +732,7 @@ def create_sglang_tts_engine_executor(
                 "modality": "audio",
             }
 
-        result = await asyncio.to_thread(_vocode)
-        if _vc < 3:
-            logger.info("[TRACE] vocode[%d] total_wall=%.1fms (includes thread dispatch)", _vc, (time.perf_counter() - _t_vocode_start) * 1000)
-        return result
+        return await asyncio.to_thread(_vocode)
 
     async def _flush_stream(payload: StagePayload | None):
         """Flush remaining un-vocoded tokens when the stream ends.

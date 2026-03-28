@@ -513,36 +513,21 @@ class S2ProSGLangModelRunner:
         return outputs
 
     def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
-        import time as _time
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-        t_exec_start = _time.perf_counter()
         schedule_batch = scheduler_output.batch_data
         model_worker_batch = schedule_batch.get_model_worker_batch()
         is_prefill = schedule_batch.forward_mode.is_extend()
 
         if is_prefill:
-            for sched_req in scheduler_output.requests:
-                data: S2ProSGLangRequestData = sched_req.data
-                prefix_len = len(data.req.prefix_indices)
-                total_ids = len(data.req.origin_input_ids)
-                extend_len = data.req.extend_input_len
-                logger.info(
-                    "[TRACE] prefill req=%s total=%d cached=%d extend=%d",
-                    sched_req.request_id[:16], total_ids, prefix_len, extend_len,
-                )
             self._inject_vq_embeds_prefill(model_worker_batch, scheduler_output)
         else:
             self._update_vq_buffers(model_worker_batch, scheduler_output)
 
-        t_prep_done = _time.perf_counter()
-
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.model_worker.model_runner
         )
-        t_fb_init = _time.perf_counter()
         batch_result = self.model_worker.forward_batch_generation(forward_batch)
-        t_fwd_done = _time.perf_counter()
 
         if schedule_batch.is_prefill_only:
             batch_result.next_token_ids = torch.zeros(
@@ -553,24 +538,7 @@ class S2ProSGLangModelRunner:
 
         self.batch_planner.record_last_batch(schedule_batch)
 
-        # Codes produced by model.forward() → read from output buffers
         outputs = self._build_outputs(scheduler_output)
-        t_output = _time.perf_counter()
-
-        step_n = getattr(self, '_trace_step', 0)
-        self._trace_step = step_n + 1
-        if step_n < 3 or step_n % 100 == 0:
-            logger.info(
-                "[TRACE] execute step=%d prefill=%s prep=%.2fms fb_init=%.2fms "
-                "gpu_fwd=%.2fms output=%.2fms total=%.2fms bs=%d",
-                step_n, is_prefill,
-                (t_prep_done - t_exec_start) * 1000,
-                (t_fb_init - t_prep_done) * 1000,
-                (t_fwd_done - t_fb_init) * 1000,
-                (t_output - t_fwd_done) * 1000,
-                (t_output - t_exec_start) * 1000,
-                len(scheduler_output.requests),
-            )
 
         text_model = self.model_worker.model_runner.model
         bs = len(scheduler_output.requests)
@@ -594,12 +562,6 @@ class S2ProSGLangModelRunner:
 class S2ProSGLangResourceManager(SGLangResourceManager):
     def free(self, request: SchedulerRequest) -> None:
         data: S2ProSGLangRequestData = request.data
-        origin_len = len(data.req.origin_input_ids)
-        output_len = len(data.req.output_ids)
-        logger.info(
-            "[PROFILE] release_kv_cache req=%s origin_ids=%d output_ids=%d total_kv=%d",
-            request.request_id[:16], origin_len, output_len, origin_len + output_len,
-        )
         release_kv_cache(data.req, self.tree_cache)
         data._previous_semantic_tokens.clear()
         data._last_codebook_values = None

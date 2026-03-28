@@ -118,29 +118,15 @@ class ModelWorker:
         self,
         forward_batch,
     ):
-        import time as _time
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
-        t0 = _time.perf_counter()
         out = self.model_runner.forward(forward_batch=forward_batch)
-        t1 = _time.perf_counter()
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-        batch_result = GenerationBatchResult(
+        return GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
             expert_distribution_metrics=out.expert_distribution_metrics,
         )
-
-        step = getattr(self, '_fwd_step', 0)
-        self._fwd_step = step + 1
-        is_prefill = hasattr(forward_batch, 'forward_mode') and forward_batch.forward_mode.is_extend()
-        bs = forward_batch.batch_size if hasattr(forward_batch, 'batch_size') else '?'
-        if step < 10 or step % 50 == 0:
-            logger.info(
-                "[PROFILE] GPU forward step=%d bs=%s prefill=%s time=%.2fms cuda_graph=%s",
-                step, bs, is_prefill, (t1 - t0) * 1000, can_run_cuda_graph,
-            )
-        return batch_result
 
 
 def _resolve_nccl_port() -> int:

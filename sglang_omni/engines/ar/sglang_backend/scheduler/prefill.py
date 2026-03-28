@@ -102,17 +102,6 @@ class PrefillManager:
                 break
 
             req.init_next_round_input(self.tree_cache)
-            tree_tokens = getattr(self.tree_cache, 'total_size', lambda: -1)() if callable(getattr(self.tree_cache, 'total_size', None)) else -1
-            logger.info(
-                "[PROFILE] prefill_schedule req=%s fill_len=%d prefix_cached=%d "
-                "extend=%d first10=%s tree_tokens=%s",
-                req.rid[:16],
-                len(req.fill_ids),
-                len(req.prefix_indices),
-                len(req.fill_ids) - len(req.prefix_indices),
-                list(req.fill_ids[:10]),
-                tree_tokens,
-            )
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
