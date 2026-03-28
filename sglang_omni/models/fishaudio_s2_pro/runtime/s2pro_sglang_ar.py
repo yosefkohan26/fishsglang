@@ -336,15 +336,16 @@ class S2ProSGLangIterationController:
             req.is_chunked -= 1
             return
 
-        codes = output.data.codes.clone()
+        # output.data.codes is already a non-overlapping view from the bulk
+        # clone in _build_outputs — no additional clone needed.
+        codes = output.data.codes
         data.output_codes.append(codes)
 
         semantic_token = codes[0, -1].item()
         data._previous_semantic_tokens.append(semantic_token)
 
-        # Codebook values for next step's VQ embedding (clone is redundant
-        # since `codes` is already cloned above, but guards against future edits)
-        data._last_codebook_values = codes[1:, 0].clone()
+        # Slice view into the already-cloned codes tensor (no extra clone)
+        data._last_codebook_values = codes[1:, 0]
 
         req.output_ids.append(semantic_token)
 
@@ -454,41 +455,66 @@ class S2ProSGLangModelRunner:
         model_worker_batch: Any,
         scheduler_output: SchedulerOutput,
     ) -> None:
-        """Update the text model's persistent VQ and sampling buffers for decode."""
+        """Update the text model's persistent VQ and sampling buffers for decode.
+
+        Batches scalar param writes into single tensor ops to minimise
+        Python-loop overhead at high batch sizes.
+        """
         text_model = self.model_worker.model_runner.model
         input_ids = model_worker_batch.input_ids
         bs = input_ids.shape[0]
+        device = input_ids.device
 
         is_semantic = (input_ids >= self._semantic_begin_id) & (
             input_ids <= self._semantic_end_id
         )
         text_model._vq_mask[:bs].copy_(is_semantic)
 
+        # Collect per-request data in Python lists, then write as batched tensors
+        temps = []
+        top_ps = []
+        rep_ps = []
+        prev_lens = []
+        # Pre-allocate a CPU buffer for prev_tokens to avoid per-row tensor creation
+        prev_buf = torch.zeros(bs, 16, dtype=torch.long)
+
         for i, sched_req in enumerate(scheduler_output.requests):
             data: S2ProSGLangRequestData = sched_req.data
             if data._last_codebook_values is not None and is_semantic[i]:
                 text_model._vq_codes[i].copy_(data._last_codebook_values)
 
-            # Update per-request sampling parameters
-            text_model._sampling_temperature[i] = data.temperature
-            text_model._sampling_top_p[i] = data.top_p
-            text_model._sampling_rep_penalty[i] = data.repetition_penalty
+            temps.append(data.temperature)
+            top_ps.append(data.top_p)
+            rep_ps.append(data.repetition_penalty)
 
-            # Update previous semantic tokens for repetition penalty
             prev = data._previous_semantic_tokens
             n = min(len(prev), 16)
-            text_model._prev_tokens_len[i] = n
+            prev_lens.append(n)
             if n > 0:
-                text_model._prev_tokens[i, :n] = torch.tensor(
-                    prev[-n:], dtype=torch.long, device=text_model._prev_tokens.device
-                )
+                prev_buf[i, :n] = torch.as_tensor(prev[-n:], dtype=torch.long)
+
+        # Single batched writes to GPU buffers
+        text_model._sampling_temperature[:bs] = torch.as_tensor(temps, dtype=torch.float32, device=device)
+        text_model._sampling_top_p[:bs] = torch.as_tensor(top_ps, dtype=torch.float32, device=device)
+        text_model._sampling_rep_penalty[:bs] = torch.as_tensor(rep_ps, dtype=torch.float32, device=device)
+        text_model._prev_tokens_len[:bs] = torch.as_tensor(prev_lens, dtype=torch.long, device=device)
+        text_model._prev_tokens[:bs] = prev_buf.to(device=device)
 
     def _build_outputs(
         self,
         scheduler_output: SchedulerOutput,
     ) -> dict[str, RequestOutput]:
-        """Read codes from model's persistent output buffers."""
+        """Read codes from model's persistent output buffers.
+
+        One bulk clone of the entire [bs, num_codebooks+1] slice instead of
+        per-row clones.  The clone is necessary because _output_codes is a
+        persistent GPU buffer overwritten every decode step.
+        """
         text_model = self.model_worker.model_runner.model
+        bs = len(scheduler_output.requests)
+        # Single bulk clone: [bs, num_codebooks+1] — one CUDA memcpy
+        all_codes = text_model._output_codes[:bs].clone()  # [bs, nc+1]
+
         outputs = {}
         for i, sched_req in enumerate(scheduler_output.requests):
             data: S2ProSGLangRequestData = sched_req.data
@@ -501,10 +527,9 @@ class S2ProSGLangModelRunner:
                 continue
 
             # [num_codebooks+1] → [num_codebooks+1, 1] for existing format
-            # .clone() is critical: _output_codes is a persistent GPU buffer
-            # overwritten every decode step. Without clone, the view aliases
-            # stale data by the time the stream builder vocodes it.
-            codes = text_model._output_codes[i].clone().unsqueeze(-1)
+            # No per-row clone needed — all_codes is already detached from
+            # the persistent buffer.  Each row is a non-overlapping view.
+            codes = all_codes[i].unsqueeze(-1)
             outputs[sched_req.request_id] = RequestOutput(
                 request_id=sched_req.request_id,
                 data=S2ProStepOutput(codes=codes),

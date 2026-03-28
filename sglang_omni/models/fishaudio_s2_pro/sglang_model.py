@@ -566,7 +566,10 @@ class S2ProSGLangTextModel(nn.Module):
             else:
                 logger.debug("Skipping weight: %s", name)
 
-        self._convert_to_fp8()
+        # FP8 disabled: dynamic per-row activation quantization overhead
+        # exceeds bandwidth savings on 4090 (RTF 1.73 vs 0.53 BF16).
+        # Needs fused quant+GEMM kernels to be worthwhile.
+        # self._convert_to_fp8()
 
     def _convert_to_fp8(self):
         """Convert Slow AR linear layers to FP8 with per-channel weight scales
