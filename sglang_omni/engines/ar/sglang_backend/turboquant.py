@@ -1,22 +1,17 @@
-"""TurboQuant_prod: Unbiased inner-product-optimal KV cache quantization, 4 bits/ch.
+"""TurboQuant KV cache quantization.
 
-Faithful implementation of the TurboQuant paper (Zandieh et al.):
-  - Full 128-d rotation via randomized Hadamard (per-layer sign diversity)
-  - Single full-vector L2 norm (one FP16 per head)
-  - Exact Lloyd-Max codebooks for Beta(d=128) distribution
-  - Uniform 3-bit MSE on all 128 channels
-  - 1-bit QJL correction on residual for unbiased inner product estimation
-  - Dense Gaussian S matrix for QJL (required for exact unbiasedness proof)
+This module still contains the paper-faithful `TurboQuant_prod` path
+(3-bit MSE + 1-bit QJL residual), but the active KV-cache integration uses
+the deterministic MSE-only reconstruction.
 
-Storage per head: 48 (3bit) + 16 (qjl) + 2 (norm) + 2 (rnorm) = 68 bytes
-BF16 per head: 256 bytes.  Compression: 3.76x.
-Per token (36 layers, 8 heads, K+V): 38.25 KB vs 144 KB.
+Why: for this TTS model, the residual QJL term adds too much variance.
+Empirically, pure MSE reconstruction sounds better end-to-end even though it
+gives up the unbiasedness guarantee. The active path now uses grouped 2x64
+4-bit MSE-only quantization plus a small recent-token BF16 cache.
 
-Why 4 bits, not 3.5:  The 3.5-bit config (64 ch at 3-bit + 64 ch at 2-bit)
-has 33% of 2-bit channel values clamped to extreme centroids.  Over 36 layers
-this destroys attention patterns completely — the model generates random
-semantic tokens (right voice, wrong words).  Uniform 3-bit reduces overflow
-from 33% to 8.3%, and the MSE drops from 0.075 to 0.034 per unit vector.
+Storage layout is unchanged:
+  48 + 16 bytes are reused as a full 64-byte 4-bit payload
+  + 2 + 2 bytes for the two half norms = 68 bytes/head.
 """
 
 from __future__ import annotations
@@ -45,6 +40,30 @@ _BOUNDARIES_3BIT_D128 = [
     -0.1532626391, -0.0923575317, -0.0440919633,
      0.0,
      0.0440919633,  0.0923575317,  0.1532626391,
+]
+_CENTROIDS_4BIT_D128 = [
+    -0.2378074305, -0.1809952734, -0.1419647482, -0.1104392440,
+    -0.0829625272, -0.0578798312, -0.0342211064, -0.0113236335,
+     0.0113286603,  0.0342211064,  0.0578798312,  0.0829625272,
+     0.1104392440,  0.1419647482,  0.1809952734,  0.2378074305,
+]
+_BOUNDARIES_4BIT_D128 = [
+    -0.2094013520, -0.1614800108, -0.1262019961, -0.0967008856,
+    -0.0704211792, -0.0460504688, -0.0227723700,  0.0000025134,
+     0.0227748834,  0.0460504688,  0.0704211792,  0.0967008856,
+     0.1262019961,  0.1614800108,  0.2094013520,
+]
+_CENTROIDS_4BIT_D64 = [
+    -0.3309249278, -0.2530586197, -0.1990016977, -0.1550604365,
+    -0.1166026352, -0.0814005930, -0.0481465008, -0.0159365436,
+     0.0159464914,  0.0481564461,  0.0814058480,  0.1166026352,
+     0.1550604365,  0.1990016977,  0.2530586197,  0.3309249278,
+]
+_BOUNDARIES_4BIT_D64 = [
+    -0.2919917737, -0.2260301587, -0.1770310671, -0.1358315359,
+    -0.0990016141, -0.0647735469, -0.0320415222,  0.0000049739,
+     0.0320514688,  0.0647811471,  0.0990042416,  0.1358315359,
+     0.1770310671,  0.2260301587,  0.2919917737,
 ]
 
 
@@ -99,6 +118,18 @@ def _unpack_3bit(packed: Tensor, out_dim: int) -> Tensor:
     ).reshape(*packed.shape[:-1], out_dim).long()
 
 
+def _pack_4bit(idx: Tensor) -> Tensor:
+    """[..., N*2] int -> [..., N] uint8. Two 4-bit values per byte."""
+    return (idx[..., 0::2] | (idx[..., 1::2] << 4)).to(torch.uint8)
+
+
+def _unpack_4bit(packed: Tensor, out_dim: int) -> Tensor:
+    """[..., N] uint8 -> [..., N*2] long."""
+    low = (packed & 0xF).long()
+    high = ((packed >> 4) & 0xF).long()
+    return torch.stack([low, high], dim=-1).reshape(*packed.shape[:-1], out_dim)
+
+
 def _pack_1bit(bits: Tensor) -> Tensor:
     """[..., 128] bool/int -> [..., 16] uint8.  8 bits per byte."""
     g = bits.view(*bits.shape[:-1], 16, 8).int()
@@ -142,6 +173,8 @@ class TurboQuant:
         # Shared Hadamard matrix (normalized: H_norm @ H_norm = I)
         H = _build_hadamard_matrix(128)
         self.H_norm = (H / math.sqrt(128)).to(device=device, dtype=torch.float32)
+        H64 = _build_hadamard_matrix(64)
+        self.H64_norm = (H64 / math.sqrt(64)).to(device=device, dtype=torch.float32)
 
         # Per-layer random sign vectors for rotation diversity
         self.D_signs = []
@@ -154,6 +187,22 @@ class TurboQuant:
             )
             self.D_signs.append(signs.to(device=device, dtype=torch.float32))
 
+        self.D64_signs_hi = []
+        self.D64_signs_lo = []
+        for layer_id in range(num_layers):
+            rng.manual_seed(seed + 10_000 + 2 * layer_id)
+            signs_hi = torch.where(
+                torch.rand(64, generator=rng) > 0.5,
+                torch.ones(64), -torch.ones(64),
+            )
+            rng.manual_seed(seed + 10_000 + 2 * layer_id + 1)
+            signs_lo = torch.where(
+                torch.rand(64, generator=rng) > 0.5,
+                torch.ones(64), -torch.ones(64),
+            )
+            self.D64_signs_hi.append(signs_hi.to(device=device, dtype=torch.float32))
+            self.D64_signs_lo.append(signs_lo.to(device=device, dtype=torch.float32))
+
         # Shared QJL projection matrix: S with i.i.d. N(0,1) entries
         rng.manual_seed(seed + num_layers + 1000)
         self.S = torch.randn(128, 128, generator=rng).to(
@@ -161,10 +210,18 @@ class TurboQuant:
         )
 
         # Exact Beta(d=128) Lloyd-Max codebook — uniform 3-bit for all channels
-        self.centroids = torch.tensor(
+        self.centroids_3bit = torch.tensor(
             _CENTROIDS_3BIT_D128, dtype=torch.float32, device=device)
-        self.boundaries = torch.tensor(
+        self.boundaries_3bit = torch.tensor(
             _BOUNDARIES_3BIT_D128, dtype=torch.float32, device=device)
+        self.centroids_4bit = torch.tensor(
+            _CENTROIDS_4BIT_D128, dtype=torch.float32, device=device)
+        self.boundaries_4bit = torch.tensor(
+            _BOUNDARIES_4BIT_D128, dtype=torch.float32, device=device)
+        self.centroids_4bit_64 = torch.tensor(
+            _CENTROIDS_4BIT_D64, dtype=torch.float32, device=device)
+        self.boundaries_4bit_64 = torch.tensor(
+            _BOUNDARIES_4BIT_D64, dtype=torch.float32, device=device)
 
         self._qjl_scale = math.sqrt(math.pi / 2.0) / 128.0
 
@@ -180,8 +237,25 @@ class TurboQuant:
         x = (flat @ self.H_norm) * self.D_signs[layer_id]
         return x.view_as(y)
 
+    def _rotate_half_forward(self, x: Tensor, layer_id: int, half: int) -> Tensor:
+        flat = x.reshape(-1, 64)
+        signs = self.D64_signs_hi[layer_id] if half == 0 else self.D64_signs_lo[layer_id]
+        y = (flat * signs) @ self.H64_norm
+        return y.view_as(x)
+
+    def _rotate_half_inverse(self, y: Tensor, layer_id: int, half: int) -> Tensor:
+        flat = y.reshape(-1, 64)
+        signs = self.D64_signs_hi[layer_id] if half == 0 else self.D64_signs_lo[layer_id]
+        x = (flat @ self.H64_norm) * signs
+        return x.view_as(y)
+
     def quantize(
-        self, x: Tensor, layer_id: int,
+        self,
+        x: Tensor,
+        layer_id: int,
+        use_qjl: bool = True,
+        mse_bits: int = 3,
+        grouped_64: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Quantize to TurboQuant_prod compressed representation.
 
@@ -189,12 +263,37 @@ class TurboQuant:
             x: [..., 128] tensor
             layer_id: transformer layer index (for per-layer rotation)
         Returns:
-            packed_mse: [..., 48] uint8  (3-bit MSE, all 128 channels)
-            packed_qjl: [..., 16] uint8  (1-bit QJL signs)
-            norms:      [...]    fp16   (input L2 norms)
-            r_norms:    [...]    fp16   (residual L2 norms)
+            packed_mse: [..., 48] uint8
+            packed_qjl: [..., 16] uint8
+            norms:      [...]    fp16
+            r_norms:    [...]    fp16
         """
         x = x.float()
+        if use_qjl and mse_bits != 3:
+            raise ValueError("QJL residual path only supports 3-bit MSE base quantization")
+        if grouped_64 and (use_qjl or mse_bits != 4):
+            raise ValueError("Grouped 2x64 mode only supports 4-bit MSE-only quantization")
+
+        if grouped_64:
+            x_hi = x[..., :64]
+            x_lo = x[..., 64:]
+            norms_hi = x_hi.norm(dim=-1)
+            norms_lo = x_lo.norm(dim=-1)
+            x_hi_unit = x_hi / norms_hi.unsqueeze(-1).clamp(min=1e-8)
+            x_lo_unit = x_lo / norms_lo.unsqueeze(-1).clamp(min=1e-8)
+
+            y_hi = self._rotate_half_forward(x_hi_unit, layer_id, 0)
+            y_lo = self._rotate_half_forward(x_lo_unit, layer_id, 1)
+            idx_hi = torch.bucketize(y_hi.contiguous(), self.boundaries_4bit_64)
+            idx_lo = torch.bucketize(y_lo.contiguous(), self.boundaries_4bit_64)
+
+            packed_full = torch.cat([_pack_4bit(idx_hi), _pack_4bit(idx_lo)], dim=-1)
+            return (
+                packed_full[..., :48],
+                packed_full[..., 48:],
+                norms_hi.half(),
+                norms_lo.half(),
+            )
 
         # 1. Full-vector normalization to unit sphere
         norms = x.norm(dim=-1)
@@ -203,26 +302,49 @@ class TurboQuant:
         # 2. Full 128-d randomized Hadamard rotation
         y = self._rotate_forward(x_unit, layer_id)
 
-        # 3. Uniform 3-bit MSE quantization on all 128 channels
-        idx = torch.bucketize(y.contiguous(), self.boundaries)  # [0..7]
+        # 3. MSE quantization on all 128 channels
+        if mse_bits == 3:
+            idx = torch.bucketize(y.contiguous(), self.boundaries_3bit)
+            y_hat = self.centroids_3bit[idx]
+            packed_main = _pack_3bit(idx)
+            packed_aux = None
+        elif mse_bits == 4:
+            idx = torch.bucketize(y.contiguous(), self.boundaries_4bit)
+            y_hat = self.centroids_4bit[idx]
+            packed_full = _pack_4bit(idx)
+            packed_main = packed_full[..., :48]
+            packed_aux = packed_full[..., 48:]
+        else:
+            raise ValueError(f"Unsupported mse_bits={mse_bits}")
 
         # 4. MSE reconstruction (needed for QJL residual)
-        y_hat = self.centroids[idx]
         x_mse = self._rotate_inverse(y_hat, layer_id)
         x_mse = x_mse * norms.unsqueeze(-1)
 
-        # 5. Residual and QJL
-        r = x - x_mse
-        r_norms = r.norm(dim=-1)
-        qjl_proj = r.reshape(-1, 128) @ self.S.T
-        qjl_signs = (qjl_proj > 0).view(*r.shape[:-1], 128)
+        if use_qjl:
+            r = x - x_mse
+            r_norms = r.norm(dim=-1)
+            qjl_proj = r.reshape(-1, 128) @ self.S.T
+            qjl_signs = (qjl_proj > 0).view(*r.shape[:-1], 128)
+            packed_qjl = _pack_1bit(qjl_signs)
+            packed_rnorm = r_norms.half()
+        else:
+            if mse_bits == 4:
+                packed_qjl = packed_aux
+            else:
+                packed_qjl = torch.zeros(
+                    *x.shape[:-1], 16, dtype=torch.uint8, device=x.device
+                )
+            packed_rnorm = torch.zeros(
+                *x.shape[:-1], dtype=torch.float16, device=x.device
+            )
 
         # 6. Pack
         return (
-            _pack_3bit(idx),       # [..., 48] uint8
-            _pack_1bit(qjl_signs), # [..., 16] uint8
+            packed_main,           # [..., 48] uint8
+            packed_qjl,            # [..., 16] uint8
             norms.half(),
-            r_norms.half(),
+            packed_rnorm,
         )
 
     def dequantize(
@@ -230,6 +352,9 @@ class TurboQuant:
         packed_mse: Tensor, packed_qjl: Tensor,
         norms: Tensor, r_norms: Tensor,
         layer_id: int,
+        use_qjl: bool = True,
+        mse_bits: int = 3,
+        grouped_64: bool = False,
     ) -> Tensor:
         """Dequantize to BF16 (Algorithm 2, DeQuant_prod).
 
@@ -242,11 +367,35 @@ class TurboQuant:
         Returns:
             x_hat: [..., 128] bfloat16
         """
+        if grouped_64:
+            packed_full = torch.cat([packed_mse, packed_qjl], dim=-1)
+            packed_hi = packed_full[..., :32]
+            packed_lo = packed_full[..., 32:]
+            idx_hi = _unpack_4bit(packed_hi, 64)
+            idx_lo = _unpack_4bit(packed_lo, 64)
+            y_hi_hat = self.centroids_4bit_64[idx_hi]
+            y_lo_hat = self.centroids_4bit_64[idx_lo]
+            x_hi = self._rotate_half_inverse(y_hi_hat, layer_id, 0)
+            x_lo = self._rotate_half_inverse(y_lo_hat, layer_id, 1)
+            x_hi = x_hi * norms.float().unsqueeze(-1)
+            x_lo = x_lo * r_norms.float().unsqueeze(-1)
+            return torch.cat([x_hi, x_lo], dim=-1).bfloat16()
+
         # 1. MSE reconstruction
-        idx = _unpack_3bit(packed_mse, 128)
-        y_hat = self.centroids[idx]
+        if mse_bits == 3:
+            idx = _unpack_3bit(packed_mse, 128)
+            y_hat = self.centroids_3bit[idx]
+        elif mse_bits == 4:
+            packed_full = torch.cat([packed_mse, packed_qjl], dim=-1)
+            idx = _unpack_4bit(packed_full, 128)
+            y_hat = self.centroids_4bit[idx]
+        else:
+            raise ValueError(f"Unsupported mse_bits={mse_bits}")
         x_mse = self._rotate_inverse(y_hat, layer_id)
         x_mse = x_mse * norms.float().unsqueeze(-1)
+
+        if not use_qjl:
+            return x_mse.bfloat16()
 
         # 2. QJL correction
         qjl_pm = _unpack_1bit(packed_qjl)                    # [..., 128] ±1
@@ -284,6 +433,11 @@ class TurboQuantKVPool:
         device: str,
         tq: TurboQuant,
         start_layer: int = 0,
+        use_qjl: bool = False,
+        mse_bits: int = 4,
+        grouped_64: bool = False,
+        recent_raw_capacity: int = 0,
+        recent_raw_max_write: int = 64,
     ):
         self.size = size
         self.page_size = page_size
@@ -297,6 +451,11 @@ class TurboQuantKVPool:
         self.start_layer = start_layer
         self.end_layer = start_layer + layer_num - 1
         self.tq = tq
+        self.use_qjl = use_qjl
+        self.mse_bits = mse_bits
+        self.grouped_64 = grouped_64
+        self.recent_raw_capacity = recent_raw_capacity
+        self.recent_raw_max_write = recent_raw_max_write
         self._current_layer_id = 0
 
         # SGLang compat
@@ -321,6 +480,29 @@ class TurboQuantKVPool:
         self.v_norm = [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
         self.v_rnorm= [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
 
+        if recent_raw_capacity > 0:
+            self.recent_k = [
+                torch.zeros(recent_raw_capacity, head_num, head_dim, dtype=torch.bfloat16, device=device)
+                for _ in range(layer_num)
+            ]
+            self.recent_v = [
+                torch.zeros(recent_raw_capacity, head_num, self.v_head_dim, dtype=torch.bfloat16, device=device)
+                for _ in range(layer_num)
+            ]
+            self.recent_slot_of_loc = torch.full(
+                (total,), -1, dtype=torch.int32, device=device
+            )
+            self.recent_slot_loc = torch.full(
+                (recent_raw_capacity,), -1, dtype=torch.int64, device=device
+            )
+            self._recent_next_slot = 0
+        else:
+            self.recent_k = None
+            self.recent_v = None
+            self.recent_slot_of_loc = None
+            self.recent_slot_loc = None
+            self._recent_next_slot = 0
+
         # Dummy empty for get_kv_buffer
         self._dummy = torch.empty(0, dtype=torch.bfloat16, device=device)
         self.k_buffer = [self._dummy for _ in range(layer_num)]
@@ -342,6 +524,30 @@ class TurboQuantKVPool:
 
     # ---- set / get ----
 
+    def _assign_recent_slots(self, loc: Tensor) -> Tensor:
+        loc_flat = loc.reshape(-1).long()
+        slots = torch.empty_like(loc_flat, dtype=torch.int32)
+        if self.recent_raw_capacity <= 0:
+            return slots.fill_(-1).view_as(loc)
+
+        loc_list = loc_flat.tolist()
+        for idx, cur_loc in enumerate(loc_list):
+            slot = self._recent_next_slot
+            old_loc = int(self.recent_slot_loc[slot].item())
+            if old_loc >= 0:
+                if int(self.recent_slot_of_loc[old_loc].item()) == slot:
+                    self.recent_slot_of_loc[old_loc] = -1
+            self.recent_slot_loc[slot] = cur_loc
+            self.recent_slot_of_loc[cur_loc] = slot
+            slots[idx] = slot
+            self._recent_next_slot = (slot + 1) % self.recent_raw_capacity
+        return slots.view_as(loc)
+
+    def _lookup_recent_slots(self, loc: Tensor) -> Tensor:
+        if self.recent_raw_capacity <= 0:
+            return torch.full_like(loc, -1, dtype=torch.int32)
+        return self.recent_slot_of_loc[loc.long()]
+
     def set_kv_buffer(
         self, layer, loc, cache_k, cache_v,
         k_scale=None, v_scale=None, layer_id_override=None,
@@ -350,8 +556,30 @@ class TurboQuantKVPool:
         li = layer_id - self.start_layer
         self._current_layer_id = layer_id
 
-        km, kq, kn, krn = self.tq.quantize(cache_k, layer_id)
-        vm, vq, vn, vrn = self.tq.quantize(cache_v, layer_id)
+        if self.recent_raw_capacity > 0:
+            if layer_id == self.start_layer:
+                if loc.numel() <= self.recent_raw_max_write:
+                    slots = self._assign_recent_slots(loc)
+                else:
+                    slots = torch.full_like(loc, -1, dtype=torch.int32)
+            else:
+                slots = self._lookup_recent_slots(loc)
+            valid_slots = slots.reshape(-1) >= 0
+            if valid_slots.any():
+                slot_flat = slots.reshape(-1)[valid_slots].long()
+                cache_k_flat = cache_k.reshape(-1, self.head_num, self.head_dim)[valid_slots]
+                cache_v_flat = cache_v.reshape(-1, self.head_num, self.v_head_dim)[valid_slots]
+                self.recent_k[li][slot_flat] = cache_k_flat.to(torch.bfloat16)
+                self.recent_v[li][slot_flat] = cache_v_flat.to(torch.bfloat16)
+
+        km, kq, kn, krn = self.tq.quantize(
+            cache_k, layer_id, use_qjl=self.use_qjl, mse_bits=self.mse_bits,
+            grouped_64=self.grouped_64,
+        )
+        vm, vq, vn, vrn = self.tq.quantize(
+            cache_v, layer_id, use_qjl=self.use_qjl, mse_bits=self.mse_bits,
+            grouped_64=self.grouped_64,
+        )
 
         self.k_mse[li][loc]   = km
         self.k_qjl[li][loc]   = kq
@@ -392,14 +620,54 @@ class TurboQuantKVPool:
         offsets = torch.arange(self.page_size, device=self.device)
         locs = (page_indices.unsqueeze(-1) * self.page_size + offsets).reshape(-1)
 
-        k = self.tq.dequantize(
-            self.k_mse[li][locs], self.k_qjl[li][locs],
-            self.k_norm[li][locs], self.k_rnorm[li][locs], layer_id,
-        )
-        v = self.tq.dequantize(
-            self.v_mse[li][locs], self.v_qjl[li][locs],
-            self.v_norm[li][locs], self.v_rnorm[li][locs], layer_id,
-        )
+        if self.recent_raw_capacity > 0:
+            slots = self._lookup_recent_slots(locs)
+            recent_mask = slots >= 0
+        else:
+            slots = None
+            recent_mask = None
+
+        if recent_mask is not None and recent_mask.any():
+            k = torch.empty(
+                locs.shape[0], self.head_num, self.head_dim,
+                dtype=torch.bfloat16, device=self.device,
+            )
+            v = torch.empty(
+                locs.shape[0], self.head_num, self.v_head_dim,
+                dtype=torch.bfloat16, device=self.device,
+            )
+            recent_slots = slots[recent_mask].long()
+            k[recent_mask] = self.recent_k[li][recent_slots]
+            v[recent_mask] = self.recent_v[li][recent_slots]
+
+            old_mask = ~recent_mask
+            if old_mask.any():
+                old_locs = locs[old_mask]
+                k[old_mask] = self.tq.dequantize(
+                    self.k_mse[li][old_locs], self.k_qjl[li][old_locs],
+                    self.k_norm[li][old_locs], self.k_rnorm[li][old_locs], layer_id,
+                    use_qjl=self.use_qjl, mse_bits=self.mse_bits,
+                    grouped_64=self.grouped_64,
+                )
+                v[old_mask] = self.tq.dequantize(
+                    self.v_mse[li][old_locs], self.v_qjl[li][old_locs],
+                    self.v_norm[li][old_locs], self.v_rnorm[li][old_locs], layer_id,
+                    use_qjl=self.use_qjl, mse_bits=self.mse_bits,
+                    grouped_64=self.grouped_64,
+                )
+        else:
+            k = self.tq.dequantize(
+                self.k_mse[li][locs], self.k_qjl[li][locs],
+                self.k_norm[li][locs], self.k_rnorm[li][locs], layer_id,
+                use_qjl=self.use_qjl, mse_bits=self.mse_bits,
+                grouped_64=self.grouped_64,
+            )
+            v = self.tq.dequantize(
+                self.v_mse[li][locs], self.v_qjl[li][locs],
+                self.v_norm[li][locs], self.v_rnorm[li][locs], layer_id,
+                use_qjl=self.use_qjl, mse_bits=self.mse_bits,
+                grouped_64=self.grouped_64,
+            )
         return (
             k.view(N, self.page_size, self.head_num, self.head_dim),
             v.view(N, self.page_size, self.head_num, self.v_head_dim),
@@ -410,6 +678,14 @@ class TurboQuantKVPool:
     def move_kv_cache(self, tgt_loc: Tensor, src_loc: Tensor):
         if tgt_loc.numel() == 0:
             return
+        if self.recent_raw_capacity > 0:
+            slots = self.recent_slot_of_loc[src_loc.long()]
+            valid = slots >= 0
+            if valid.any():
+                valid_slots = slots[valid].long()
+                self.recent_slot_of_loc[tgt_loc[valid].long()] = slots[valid]
+                self.recent_slot_of_loc[src_loc[valid].long()] = -1
+                self.recent_slot_loc[valid_slots] = tgt_loc[valid].long()
         for li in range(self.layer_num):
             for buf_list in (self.k_mse, self.k_qjl, self.k_norm, self.k_rnorm,
                              self.v_mse, self.v_qjl, self.v_norm, self.v_rnorm):
@@ -438,6 +714,9 @@ class TurboQuantKVPool:
         for attr in ("k_mse", "k_qjl", "k_norm", "k_rnorm",
                       "v_mse", "v_qjl", "v_norm", "v_rnorm"):
             delattr(self, attr)
+        for attr in ("recent_k", "recent_v", "recent_slot_of_loc", "recent_slot_loc"):
+            if hasattr(self, attr):
+                delattr(self, attr)
 
     def maybe_get_custom_mem_pool(self):
         return None
@@ -519,7 +798,12 @@ def inject_turboquant(model_runner):
     logger.info("TurboQuant: freed BF16 pool. VRAM free: %.2f GB", free_before / 1e9)
 
     tq = TurboQuant(params["device"], num_layers=params["layer_num"])
-    tq_pool = TurboQuantKVPool(tq=tq, **params)
+    tq_pool = TurboQuantKVPool(
+        tq=tq, use_qjl=False, mse_bits=4, grouped_64=True,
+        recent_raw_capacity=min(params["size"] + params["page_size"], 1024),
+        recent_raw_max_write=64,
+        **params
+    )
     model_runner.token_to_kv_pool = tq_pool
     _ACTIVE_TQ_POOL = tq_pool
 
@@ -546,7 +830,9 @@ def inject_turboquant(model_runner):
         logger.warning("Could not patch FA backend: %s", exc)
 
     logger.info(
-        "TurboQuant_prod: active. %d slots x %d layers, 4 bits/ch (3 MSE + 1 QJL), "
-        "68 bytes/head, 3.76x compression",
-        params["size"], params["layer_num"],
+        "TurboQuant: active. %d slots x %d layers, MSE-only reconstruction "
+        "(QJL disabled, grouped 2x64 4-bit) + recent BF16 tail "
+        "(cap=%d, max_write=%d)",
+        params["size"], params["layer_num"], tq_pool.recent_raw_capacity,
+        tq_pool.recent_raw_max_write,
     )
