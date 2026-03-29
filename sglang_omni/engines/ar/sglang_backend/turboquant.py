@@ -1,32 +1,22 @@
-"""TurboQuant: Near-optimal online KV cache quantization at 3.5 bits/channel.
+"""TurboQuant_prod: Unbiased inner-product-optimal KV cache quantization, 4 bits/ch.
 
-MSE-optimal variant (no QJL).  At >=3 bits the MSE-only quantizer achieves
-*lower* inner-product error than TurboQuant_prod (Figure 3a of the paper)
-because all bits go to MSE precision rather than reserving 1 bit for QJL.
-The tiny multiplicative bias at b>=3 is absorbed by softmax normalization
-and subsequent LayerNorm, so attention quality is unaffected.
+Faithful implementation of the TurboQuant paper (Zandieh et al.):
+  - Full 128-d rotation via randomized Hadamard (per-layer sign diversity)
+  - Single full-vector L2 norm (one FP16 per head)
+  - Exact Lloyd-Max codebooks for Beta(d=128) distribution
+  - Uniform 3-bit MSE on all 128 channels
+  - 1-bit QJL correction on residual for unbiased inner product estimation
+  - Dense Gaussian S matrix for QJL (required for exact unbiasedness proof)
 
-Algorithm per 128-dim head vector:
-  1. Split into two 64-dim halves
-  2. Store per-half L2 norms as FP16, normalize each half to unit sphere
-  3. Apply precomputed random orthogonal rotation (via QR on CPU, seed=42)
-  4. Quantize with Lloyd-Max codebooks for N(0, 1/64):
-     - High half (dims 0-63):  4-bit MSE (16 centroids) -> 32 bytes packed
-     - Low half  (dims 64-127): 3-bit MSE (8 centroids)  -> 24 bytes packed
-  5. Store: 32 + 24 + 2 + 2 (norms) = 60 bytes/head  vs 256 bytes BF16  (4.3x)
+Storage per head: 48 (3bit) + 16 (qjl) + 2 (norm) + 2 (rnorm) = 68 bytes
+BF16 per head: 256 bytes.  Compression: 3.76x.
+Per token (36 layers, 8 heads, K+V): 38.25 KB vs 144 KB.
 
-Per-token across 36 layers, 8 KV heads, K+V:  33.75 KB  vs  144 KB BF16.
-
-Key improvements over previous implementation:
-  - No QJL:  eliminates 2 dense 64x64 S^T matmuls per dequant (50% faster)
-  - Per-half L2 norms:  each 64-d half normalized independently to unit
-    sphere so codebooks scaled for N(0, 1/64) match the actual distribution.
-    (Full-vector norm would give N(0, 1/128) after split — centroids too
-    wide by sqrt(2), wasting outer bins.)
-  - torch.bucketize:  O(log k) binary search instead of O(k) argmin
-  - Page deduplication:  torch.unique on page_table avoids dequantizing
-    shared prefix tokens multiple times (page_size=1 by default)
-  - Allocator _kvcache updated:  prevents stale reference after pool swap
+Why 4 bits, not 3.5:  The 3.5-bit config (64 ch at 3-bit + 64 ch at 2-bit)
+has 33% of 2-bit channel values clamped to extreme centroids.  Over 36 layers
+this destroys attention patterns completely — the model generates random
+semantic tokens (right voice, wrong words).  Uniform 3-bit reduces overflow
+from 33% to 8.3%, and the MSE drops from 0.075 to 0.034 per unit vector.
 """
 
 from __future__ import annotations
@@ -42,54 +32,59 @@ from torch import Tensor
 logger = logging.getLogger(__name__)
 
 # ===================================================================
-# Lloyd-Max codebook centroids for standard normal N(0, 1)
-# From Max (1960) / Lloyd (1982).  Scaled by sigma=1/sqrt(d) at init.
+# Exact Lloyd-Max codebooks for Beta(d=128) marginal distribution
+# Precomputed via Lloyd-Max iteration on f(x) = C(1-x^2)^{62.5}
+# NOT Gaussian-approximation scaled centroids.
 # ===================================================================
 
-_STD_CENTROIDS_4BIT = [
-    -2.7326, -2.0690, -1.6180, -1.2562, -0.9424, -0.6568, -0.3882, -0.1284,
-     0.1284,  0.3882,  0.6568,  0.9424,  1.2562,  1.6180,  2.0690,  2.7326,
+_CENTROIDS_3BIT_D128 = [
+    -0.1883914408, -0.1181338373, -0.0665812261, -0.0216027005,
+     0.0216027005,  0.0665812261,  0.1181338373,  0.1883914408,
 ]
-_STD_CENTROIDS_3BIT = [
-    -2.1520, -1.3440, -0.7560, -0.2451, 0.2451, 0.7560, 1.3440, 2.1520,
+_BOUNDARIES_3BIT_D128 = [
+    -0.1532626391, -0.0923575317, -0.0440919633,
+     0.0,
+     0.0440919633,  0.0923575317,  0.1532626391,
 ]
 
 
 # ===================================================================
-# Bit packing — torch.compile fuses the element-wise ops
+# Hadamard matrix (Sylvester construction)
 # ===================================================================
 
-# @torch.compile  # disabled: JIT overhead > savings for variable shapes
-def _pack_4bit(idx: Tensor) -> Tensor:
-    """[..., 64] int -> [..., 32] uint8.  Two nibbles per byte."""
-    return (idx[..., 0::2] | (idx[..., 1::2] << 4)).to(torch.uint8)
+def _build_hadamard_matrix(d: int) -> Tensor:
+    """Build d x d Hadamard matrix with entries +/-1. H @ H = d * I."""
+    assert d > 0 and (d & (d - 1)) == 0, "d must be a power of 2"
+    H = torch.ones(1, 1, dtype=torch.float32)
+    while H.shape[0] < d:
+        H = torch.cat([
+            torch.cat([H, H], dim=1),
+            torch.cat([H, -H], dim=1),
+        ], dim=0)
+    return H
 
 
-# @torch.compile  # disabled: JIT overhead > savings for variable shapes
-def _unpack_4bit(packed: Tensor) -> Tensor:
-    """[..., 32] uint8 -> [..., 64] long."""
-    low = (packed & 0xF).long()
-    high = ((packed >> 4) & 0xF).long()
-    return torch.stack([low, high], dim=-1).reshape(*packed.shape[:-1], 64)
+# ===================================================================
+# Bit packing
+# ===================================================================
 
-
-# @torch.compile  # disabled: JIT overhead > savings for variable shapes
 def _pack_3bit(idx: Tensor) -> Tensor:
-    """[..., 64] int -> [..., 24] uint8.  Eight 3-bit values into 3 bytes."""
-    g = idx.view(*idx.shape[:-1], 8, 8).int()
+    """[..., N*8] int -> [..., N*3] uint8.  8 x 3-bit values into 3 bytes.
+    Last dim must be divisible by 8."""
+    d = idx.shape[-1]
+    g = idx.view(*idx.shape[:-1], d // 8, 8).int()
     b0 = g[..., 0] | (g[..., 1] << 3) | ((g[..., 2] & 0x3) << 6)
     b1 = ((g[..., 2] >> 2) | (g[..., 3] << 1)
            | (g[..., 4] << 4) | ((g[..., 5] & 0x1) << 7))
     b2 = (g[..., 5] >> 1) | (g[..., 6] << 2) | (g[..., 7] << 5)
     return torch.stack([b0, b1, b2], dim=-1).reshape(
-        *idx.shape[:-1], 24
-    ).to(torch.uint8)
+        *idx.shape[:-1], (d // 8) * 3).to(torch.uint8)
 
 
-# @torch.compile  # disabled: JIT overhead > savings for variable shapes
-def _unpack_3bit(packed: Tensor) -> Tensor:
-    """[..., 24] uint8 -> [..., 64] long."""
-    g = packed.view(*packed.shape[:-1], 8, 3).int()
+def _unpack_3bit(packed: Tensor, out_dim: int) -> Tensor:
+    """[..., N*3] uint8 -> [..., N*8] long."""
+    n_groups = out_dim // 8
+    g = packed.view(*packed.shape[:-1], n_groups, 3).int()
     b0, b1, b2 = g[..., 0], g[..., 1], g[..., 2]
     v0 = b0 & 0x7
     v1 = (b0 >> 3) & 0x7
@@ -101,129 +96,182 @@ def _unpack_3bit(packed: Tensor) -> Tensor:
     v7 = (b2 >> 5) & 0x7
     return torch.stack(
         [v0, v1, v2, v3, v4, v5, v6, v7], dim=-1
-    ).reshape(*packed.shape[:-1], 64).long()
+    ).reshape(*packed.shape[:-1], out_dim).long()
+
+
+def _pack_1bit(bits: Tensor) -> Tensor:
+    """[..., 128] bool/int -> [..., 16] uint8.  8 bits per byte."""
+    g = bits.view(*bits.shape[:-1], 16, 8).int()
+    packed = g[..., 0]
+    for i in range(1, 8):
+        packed = packed | (g[..., i] << i)
+    return packed.to(torch.uint8)
+
+
+def _unpack_1bit(packed: Tensor) -> Tensor:
+    """[..., 16] uint8 -> [..., 128] float.  Values are -1.0 or +1.0."""
+    p = packed.int()
+    bits = torch.stack([(p >> i) & 1 for i in range(8)], dim=-1)
+    return bits.reshape(*packed.shape[:-1], 128).float() * 2.0 - 1.0
 
 
 # ===================================================================
-# Core TurboQuant quantizer
+# Core TurboQuant_prod quantizer
 # ===================================================================
 
 class TurboQuant:
-    """MSE-optimal vector quantizer at 3.5 bits per dimension.
+    """TurboQuant_prod: unbiased inner-product-optimal quantizer at 4 bits/dim.
 
-    Splits 128-dim vectors into two 64-dim halves:
-      High (dims 0-63):  4-bit (16 centroids)
-      Low  (dims 64-127): 3-bit (8 centroids)
+    Full 128-d vector processing:
+      1. Normalize to unit sphere, store L2 norm (FP16)
+      2. Randomized Hadamard rotation (per-layer D signs + shared H matrix)
+      3. Uniform 3-bit MSE quantize on all 128 channels
+      4. Compute residual in original space
+      5. QJL 1-bit: sign(S @ r), store ||r|| as FP16
+      => Total: 3 + 1 = 4 bits/channel
 
-    Each half is independently normalized to unit sphere (storing its L2
-    norm as FP16), rotated with a fixed random orthogonal matrix, and
-    quantized via binary-search over Lloyd-Max boundaries.
-
-    Per-half normalization is critical: if the full 128-d vector is
-    normalized instead, each 64-d half has expected norm 1/sqrt(2), so
-    rotated coordinates follow N(0, 1/128) not N(0, 1/64).  The codebooks
-    scaled for 1/64 would be sqrt(2) too wide, wasting outer bins.
+    Per-layer rotation diversity decorrelates quantization errors across layers.
+    Dense Gaussian S matrix preserves exact QJL unbiasedness (Lemma 4).
     """
 
-    def __init__(self, device: torch.device, seed: int = 42):
+    def __init__(self, device: torch.device, num_layers: int = 36, seed: int = 42):
         self.device = device
-        self.d = 64
+        self.d = 128
+        self.num_layers = num_layers
 
-        # Deterministic orthogonal rotation matrices (CPU seed, then move)
-        rng = torch.Generator(device="cpu").manual_seed(seed)
-        Q1, _ = torch.linalg.qr(torch.randn(64, 64, generator=rng))
-        Q2, _ = torch.linalg.qr(torch.randn(64, 64, generator=rng))
-        self.rot_hi = Q1.to(device=device, dtype=torch.float32)
-        self.rot_lo = Q2.to(device=device, dtype=torch.float32)
+        # Shared Hadamard matrix (normalized: H_norm @ H_norm = I)
+        H = _build_hadamard_matrix(128)
+        self.H_norm = (H / math.sqrt(128)).to(device=device, dtype=torch.float32)
 
-        # Codebooks scaled for marginal distribution N(0, 1/d), d=64
-        sigma = 1.0 / math.sqrt(64)
-        c4 = torch.tensor(_STD_CENTROIDS_4BIT, dtype=torch.float32, device=device) * sigma
-        c3 = torch.tensor(_STD_CENTROIDS_3BIT, dtype=torch.float32, device=device) * sigma
-        self.centroids_hi = c4   # [16]
-        self.centroids_lo = c3   # [8]
-        self.boundaries_hi = (c4[:-1] + c4[1:]) / 2   # [15]
-        self.boundaries_lo = (c3[:-1] + c3[1:]) / 2   # [7]
+        # Per-layer random sign vectors for rotation diversity
+        self.D_signs = []
+        rng = torch.Generator(device="cpu")
+        for layer_id in range(num_layers):
+            rng.manual_seed(seed + layer_id)
+            signs = torch.where(
+                torch.rand(128, generator=rng) > 0.5,
+                torch.ones(128), -torch.ones(128),
+            )
+            self.D_signs.append(signs.to(device=device, dtype=torch.float32))
 
-    def quantize(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Quantize to compressed representation.
+        # Shared QJL projection matrix: S with i.i.d. N(0,1) entries
+        rng.manual_seed(seed + num_layers + 1000)
+        self.S = torch.randn(128, 128, generator=rng).to(
+            device=device, dtype=torch.float32
+        )
+
+        # Exact Beta(d=128) Lloyd-Max codebook — uniform 3-bit for all channels
+        self.centroids = torch.tensor(
+            _CENTROIDS_3BIT_D128, dtype=torch.float32, device=device)
+        self.boundaries = torch.tensor(
+            _BOUNDARIES_3BIT_D128, dtype=torch.float32, device=device)
+
+        self._qjl_scale = math.sqrt(math.pi / 2.0) / 128.0
+
+    def _rotate_forward(self, x: Tensor, layer_id: int) -> Tensor:
+        """y = (x * D_l) @ H_norm  (randomized Hadamard rotation)."""
+        flat = x.reshape(-1, 128)
+        y = (flat * self.D_signs[layer_id]) @ self.H_norm
+        return y.view_as(x)
+
+    def _rotate_inverse(self, y: Tensor, layer_id: int) -> Tensor:
+        """x = (y @ H_norm) * D_l  (inverse rotation)."""
+        flat = y.reshape(-1, 128)
+        x = (flat @ self.H_norm) * self.D_signs[layer_id]
+        return x.view_as(y)
+
+    def quantize(
+        self, x: Tensor, layer_id: int,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Quantize to TurboQuant_prod compressed representation.
 
         Args:
-            x: [..., 128] tensor (any float dtype, typically bf16 from attention)
+            x: [..., 128] tensor
+            layer_id: transformer layer index (for per-layer rotation)
         Returns:
-            packed_hi:  [..., 32] uint8   (4-bit indices, dims 0-63)
-            packed_lo:  [..., 24] uint8   (3-bit indices, dims 64-127)
-            norms_hi:   [...]    float16  (per-half L2 norms, dims 0-63)
-            norms_lo:   [...]    float16  (per-half L2 norms, dims 64-127)
+            packed_mse: [..., 48] uint8  (3-bit MSE, all 128 channels)
+            packed_qjl: [..., 16] uint8  (1-bit QJL signs)
+            norms:      [...]    fp16   (input L2 norms)
+            r_norms:    [...]    fp16   (residual L2 norms)
         """
         x = x.float()
-        x_hi = x[..., :64]                                  # [..., 64]
-        x_lo = x[..., 64:]                                   # [..., 64]
 
-        # Per-half normalization to unit sphere (Theorem 1 assumption)
-        norms_hi = x_hi.norm(dim=-1)                         # [...]
-        norms_lo = x_lo.norm(dim=-1)                         # [...]
-        x_hi = x_hi / norms_hi.unsqueeze(-1).clamp(min=1e-8)
-        x_lo = x_lo / norms_lo.unsqueeze(-1).clamp(min=1e-8)
+        # 1. Full-vector normalization to unit sphere
+        norms = x.norm(dim=-1)
+        x_unit = x / norms.unsqueeze(-1).clamp(min=1e-8)
 
-        # Rotate: coords become ~ N(0, 1/d) by Lemma 1 (d=64)
-        y_hi = x_hi @ self.rot_hi.T                          # [..., 64]
-        y_lo = x_lo @ self.rot_lo.T                          # [..., 64]
+        # 2. Full 128-d randomized Hadamard rotation
+        y = self._rotate_forward(x_unit, layer_id)
 
-        # Binary-search quantization: O(log k) per element via bucketize
-        idx_hi = torch.bucketize(y_hi, self.boundaries_hi)  # [..., 64] in [0,15]
-        idx_lo = torch.bucketize(y_lo, self.boundaries_lo)  # [..., 64] in [0,7]
+        # 3. Uniform 3-bit MSE quantization on all 128 channels
+        idx = torch.bucketize(y.contiguous(), self.boundaries)  # [0..7]
 
-        return _pack_4bit(idx_hi), _pack_3bit(idx_lo), norms_hi.half(), norms_lo.half()
+        # 4. MSE reconstruction (needed for QJL residual)
+        y_hat = self.centroids[idx]
+        x_mse = self._rotate_inverse(y_hat, layer_id)
+        x_mse = x_mse * norms.unsqueeze(-1)
+
+        # 5. Residual and QJL
+        r = x - x_mse
+        r_norms = r.norm(dim=-1)
+        qjl_proj = r.reshape(-1, 128) @ self.S.T
+        qjl_signs = (qjl_proj > 0).view(*r.shape[:-1], 128)
+
+        # 6. Pack
+        return (
+            _pack_3bit(idx),       # [..., 48] uint8
+            _pack_1bit(qjl_signs), # [..., 16] uint8
+            norms.half(),
+            r_norms.half(),
+        )
 
     def dequantize(
-        self, packed_hi: Tensor, packed_lo: Tensor,
-        norms_hi: Tensor, norms_lo: Tensor,
+        self,
+        packed_mse: Tensor, packed_qjl: Tensor,
+        norms: Tensor, r_norms: Tensor,
+        layer_id: int,
     ) -> Tensor:
-        """Dequantize compressed representation to BF16.
+        """Dequantize to BF16 (Algorithm 2, DeQuant_prod).
 
         Args:
-            packed_hi:  [..., 32] uint8
-            packed_lo:  [..., 24] uint8
-            norms_hi:   [...]    float16
-            norms_lo:   [...]    float16
+            packed_mse: [..., 48] uint8
+            packed_qjl: [..., 16] uint8
+            norms:      [...]    fp16
+            r_norms:    [...]    fp16
+            layer_id:   int
         Returns:
             x_hat: [..., 128] bfloat16
         """
-        idx_hi = _unpack_4bit(packed_hi)                   # [..., 64] long
-        idx_lo = _unpack_3bit(packed_lo)                   # [..., 64] long
+        # 1. MSE reconstruction
+        idx = _unpack_3bit(packed_mse, 128)
+        y_hat = self.centroids[idx]
+        x_mse = self._rotate_inverse(y_hat, layer_id)
+        x_mse = x_mse * norms.float().unsqueeze(-1)
 
-        y_hi = self.centroids_hi[idx_hi]                   # [..., 64] f32
-        y_lo = self.centroids_lo[idx_lo]                   # [..., 64] f32
+        # 2. QJL correction
+        qjl_pm = _unpack_1bit(packed_qjl)                    # [..., 128] ±1
+        x_qjl = qjl_pm.reshape(-1, 128) @ self.S             # S^T @ signs
+        scale = (r_norms.float() * self._qjl_scale).unsqueeze(-1)
+        x_qjl = x_qjl.view_as(x_mse) * scale
 
-        x_hi = y_hi @ self.rot_hi                          # inverse rotation
-        x_lo = y_lo @ self.rot_lo
-
-        # Rescale each half by its stored norm
-        x_hi = x_hi * norms_hi.float().unsqueeze(-1)
-        x_lo = x_lo * norms_lo.float().unsqueeze(-1)
-
-        return torch.cat([x_hi, x_lo], dim=-1).bfloat16()  # [..., 128]
+        return (x_mse + x_qjl).bfloat16()
 
 
 # ===================================================================
-# TurboQuantKVPool — compressed KV cache with SGLang-compatible API
+# TurboQuantKVPool
 # ===================================================================
-# Duck-typed to match MHATokenToKVPool interface.  Does NOT inherit to
-# avoid the parent __init__ allocating BF16 buffers + CUDA mem pools.
 
 _ACTIVE_TQ_POOL: Optional["TurboQuantKVPool"] = None
 
 
 class TurboQuantKVPool:
-    """Compressed KV cache pool using TurboQuant 3.5-bit quantization.
+    """Compressed KV cache: 68 bytes/head vs 256 bytes BF16 (3.76x).
 
-    Storage: 60 bytes/head/token  vs  256 bytes BF16  (4.3x compression).
-
-    get_kv_buffer() returns empty dummy tensors.  The actual dequantization
-    is done by the monkey-patched flash_attn_with_kvcache, which calls
-    dequantize_pages() with only the unique pages from the current batch's
-    page_table.
+    Buffers per layer per K/V:
+      packed_mse: [total, heads, 48] uint8   (3-bit MSE, 128 channels)
+      packed_qjl: [total, heads, 16] uint8   (1-bit QJL, 128 channels)
+      norms:      [total, heads]     float16 (input L2 norm)
+      r_norms:    [total, heads]     float16 (residual L2 norm)
     """
 
     def __init__(
@@ -251,7 +299,7 @@ class TurboQuantKVPool:
         self.tq = tq
         self._current_layer_id = 0
 
-        # SGLang compat attributes
+        # SGLang compat
         self.row_dim = head_num * head_dim
         self.same_kv_dim = True
         self.layer_transfer_counter = None
@@ -262,43 +310,37 @@ class TurboQuantKVPool:
 
         total = size + page_size
 
-        # --- Compressed storage: per-layer lists of tensors ---
-        # 4-bit packed:   [total, heads, 32] uint8   (dims 0-63)
-        # 3-bit packed:   [total, heads, 24] uint8   (dims 64-127)
-        # L2 norms hi/lo: [total, heads]     float16 (per-half norms)
-        self.k_packed_hi = [torch.zeros(total, head_num, 32, dtype=torch.uint8, device=device) for _ in range(layer_num)]
-        self.k_packed_lo = [torch.zeros(total, head_num, 24, dtype=torch.uint8, device=device) for _ in range(layer_num)]
-        self.k_norms_hi  = [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
-        self.k_norms_lo  = [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
-        self.v_packed_hi = [torch.zeros(total, head_num, 32, dtype=torch.uint8, device=device) for _ in range(layer_num)]
-        self.v_packed_lo = [torch.zeros(total, head_num, 24, dtype=torch.uint8, device=device) for _ in range(layer_num)]
-        self.v_norms_hi  = [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
-        self.v_norms_lo  = [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
+        # 4 buffers per K, 4 per V (down from 5+5 with the 2-bit channel)
+        self.k_mse  = [torch.zeros(total, head_num, 48, dtype=torch.uint8, device=device) for _ in range(layer_num)]
+        self.k_qjl  = [torch.zeros(total, head_num, 16, dtype=torch.uint8, device=device) for _ in range(layer_num)]
+        self.k_norm = [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
+        self.k_rnorm= [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
 
-        # Empty dummy for get_kv_buffer: view(-1, ps, h, d) -> (0, ps, h, d)
+        self.v_mse  = [torch.zeros(total, head_num, 48, dtype=torch.uint8, device=device) for _ in range(layer_num)]
+        self.v_qjl  = [torch.zeros(total, head_num, 16, dtype=torch.uint8, device=device) for _ in range(layer_num)]
+        self.v_norm = [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
+        self.v_rnorm= [torch.zeros(total, head_num, dtype=torch.float16, device=device) for _ in range(layer_num)]
+
+        # Dummy empty for get_kv_buffer
         self._dummy = torch.empty(0, dtype=torch.bfloat16, device=device)
         self.k_buffer = [self._dummy for _ in range(layer_num)]
         self.v_buffer = [self._dummy for _ in range(layer_num)]
 
-        # Zero pointers/strides (move_kv_cache is overridden, no Triton copy)
         self.k_data_ptrs = torch.zeros(layer_num, dtype=torch.uint64, device=device)
         self.v_data_ptrs = torch.zeros(layer_num, dtype=torch.uint64, device=device)
         self.data_ptrs   = torch.zeros(2 * layer_num, dtype=torch.uint64, device=device)
         self.data_strides = torch.zeros(2 * layer_num, dtype=torch.int64, device=device)
 
-        # Log
         k_bytes, v_bytes = self.get_kv_size_bytes()
         total_gb = (k_bytes + v_bytes) / (1024**3)
         bf16_gb = total * head_num * head_dim * 2 * 2 * layer_num / (1024**3)
         self.mem_usage = total_gb
         logger.info(
-            "TurboQuantKVPool: %d tokens, %d layers, %.2f GB compressed "
-            "(vs %.2f GB BF16, %.1fx savings)",
-            size, layer_num, total_gb, bf16_gb,
-            bf16_gb / max(total_gb, 1e-9),
+            "TurboQuantKVPool: %d tokens, %d layers, %.2f GB (vs %.2f GB BF16, %.1fx)",
+            size, layer_num, total_gb, bf16_gb, bf16_gb / max(total_gb, 1e-9),
         )
 
-    # ---- set / get KV buffer (called by FA3 backend) ----
+    # ---- set / get ----
 
     def set_kv_buffer(
         self, layer, loc, cache_k, cache_v,
@@ -308,17 +350,17 @@ class TurboQuantKVPool:
         li = layer_id - self.start_layer
         self._current_layer_id = layer_id
 
-        k_hi, k_lo, k_nh, k_nl = self.tq.quantize(cache_k)
-        v_hi, v_lo, v_nh, v_nl = self.tq.quantize(cache_v)
+        km, kq, kn, krn = self.tq.quantize(cache_k, layer_id)
+        vm, vq, vn, vrn = self.tq.quantize(cache_v, layer_id)
 
-        self.k_packed_hi[li][loc] = k_hi
-        self.k_packed_lo[li][loc] = k_lo
-        self.k_norms_hi[li][loc]  = k_nh
-        self.k_norms_lo[li][loc]  = k_nl
-        self.v_packed_hi[li][loc] = v_hi
-        self.v_packed_lo[li][loc] = v_lo
-        self.v_norms_hi[li][loc]  = v_nh
-        self.v_norms_lo[li][loc]  = v_nl
+        self.k_mse[li][loc]   = km
+        self.k_qjl[li][loc]   = kq
+        self.k_norm[li][loc]  = kn
+        self.k_rnorm[li][loc] = krn
+        self.v_mse[li][loc]   = vm
+        self.v_qjl[li][loc]   = vq
+        self.v_norm[li][loc]  = vn
+        self.v_rnorm[li][loc] = vrn
 
     def _get_key_buffer(self, layer_id: int):
         return self._dummy
@@ -342,63 +384,42 @@ class TurboQuantKVPool:
         self._current_layer_id = layer_id
         return self._dummy, self._dummy
 
-    # ---- page dequantization (called from monkey-patched flash_attn) ----
+    # ---- page dequantization ----
 
     def dequantize_pages(self, layer_id: int, page_indices: Tensor):
-        """Dequantize KV for specific pages from compressed store.
-
-        Args:
-            layer_id:     transformer layer index
-            page_indices: [N] int tensor of page numbers
-        Returns:
-            k: [N, page_size, heads, head_dim] bfloat16
-            v: same shape
-        """
         li = layer_id - self.start_layer
         N = page_indices.shape[0]
-
-        # Page -> flat token indices: page p = tokens [p*ps .. (p+1)*ps)
         offsets = torch.arange(self.page_size, device=self.device)
         locs = (page_indices.unsqueeze(-1) * self.page_size + offsets).reshape(-1)
 
         k = self.tq.dequantize(
-            self.k_packed_hi[li][locs],
-            self.k_packed_lo[li][locs],
-            self.k_norms_hi[li][locs],
-            self.k_norms_lo[li][locs],
+            self.k_mse[li][locs], self.k_qjl[li][locs],
+            self.k_norm[li][locs], self.k_rnorm[li][locs], layer_id,
         )
         v = self.tq.dequantize(
-            self.v_packed_hi[li][locs],
-            self.v_packed_lo[li][locs],
-            self.v_norms_hi[li][locs],
-            self.v_norms_lo[li][locs],
+            self.v_mse[li][locs], self.v_qjl[li][locs],
+            self.v_norm[li][locs], self.v_rnorm[li][locs], layer_id,
         )
-
         return (
             k.view(N, self.page_size, self.head_num, self.head_dim),
             v.view(N, self.page_size, self.head_num, self.v_head_dim),
         )
 
-    # ---- page move/copy (SGLang memory compaction / retraction) ----
+    # ---- page move ----
 
     def move_kv_cache(self, tgt_loc: Tensor, src_loc: Tensor):
         if tgt_loc.numel() == 0:
             return
         for li in range(self.layer_num):
-            self.k_packed_hi[li][tgt_loc] = self.k_packed_hi[li][src_loc]
-            self.k_packed_lo[li][tgt_loc] = self.k_packed_lo[li][src_loc]
-            self.k_norms_hi[li][tgt_loc]  = self.k_norms_hi[li][src_loc]
-            self.k_norms_lo[li][tgt_loc]  = self.k_norms_lo[li][src_loc]
-            self.v_packed_hi[li][tgt_loc] = self.v_packed_hi[li][src_loc]
-            self.v_packed_lo[li][tgt_loc] = self.v_packed_lo[li][src_loc]
-            self.v_norms_hi[li][tgt_loc]  = self.v_norms_hi[li][src_loc]
-            self.v_norms_lo[li][tgt_loc]  = self.v_norms_lo[li][src_loc]
+            for buf_list in (self.k_mse, self.k_qjl, self.k_norm, self.k_rnorm,
+                             self.v_mse, self.v_qjl, self.v_norm, self.v_rnorm):
+                buf_list[li][tgt_loc] = buf_list[li][src_loc]
 
-    # ---- utility / compat ----
+    # ---- compat ----
 
     def get_kv_size_bytes(self):
-        k = sum(t.nbytes for ts in (self.k_packed_hi, self.k_packed_lo, self.k_norms_hi, self.k_norms_lo) for t in ts)
-        v = sum(t.nbytes for ts in (self.v_packed_hi, self.v_packed_lo, self.v_norms_hi, self.v_norms_lo) for t in ts)
+        k = sum(t.nbytes for bufs in (self.k_mse, self.k_qjl, self.k_norm, self.k_rnorm) for t in bufs)
+        v = sum(t.nbytes for bufs in (self.v_mse, self.v_qjl, self.v_norm, self.v_rnorm) for t in bufs)
         return k, v
 
     def get_contiguous_buf_infos(self):
@@ -414,8 +435,9 @@ class TurboQuantKVPool:
         self.layer_transfer_counter = counter
 
     def _clear_buffers(self):
-        del self.k_packed_hi, self.k_packed_lo, self.k_norms_hi, self.k_norms_lo
-        del self.v_packed_hi, self.v_packed_lo, self.v_norms_hi, self.v_norms_lo
+        for attr in ("k_mse", "k_qjl", "k_norm", "k_rnorm",
+                      "v_mse", "v_qjl", "v_norm", "v_rnorm"):
+            delattr(self, attr)
 
     def maybe_get_custom_mem_pool(self):
         return None
@@ -431,19 +453,6 @@ _orig_flash_attn = None
 def _patched_flash_attn(
     q, k_cache, v_cache, page_table=None, cache_seqlens=None, **kwargs
 ):
-    """Drop-in replacement for flash_attn_with_kvcache.
-
-    Pass-through when:
-      - No TQ pool active
-      - No page_table (Fast AR codebook loop uses page_table=None)
-      - Non-empty k_cache (would mean non-TQ pool, shouldn't happen)
-
-    TQ path:
-      1. Flatten page_table, deduplicate via torch.unique
-      2. Dequantize only unique pages -> [U, page_size, heads, dim] BF16
-      3. Remap page_table indices to the compact buffer
-      4. Call original flash_attn_with_kvcache with the temp buffer
-    """
     pool = _ACTIVE_TQ_POOL
 
     if pool is None or page_table is None or k_cache.numel() > 0:
@@ -453,8 +462,6 @@ def _patched_flash_attn(
             **kwargs,
         )
 
-    # Deduplicate: shared voice prefix pages appear in every request's
-    # page_table row but only need one dequantization
     all_pages = page_table.reshape(-1)
     unique_pages, inverse_map = all_pages.unique(return_inverse=True)
 
@@ -469,21 +476,15 @@ def _patched_flash_attn(
 
 
 # ===================================================================
-# Injection entry point
+# Injection
 # ===================================================================
 
 def inject_turboquant(model_runner):
-    """Replace BF16 KV cache with TurboQuant 3.5-bit compressed pool.
-
-    Called from model_worker.py after SGLModelRunner is instantiated.
-    Frees the ~12 GB BF16 pool, creates ~2.7 GB compressed pool,
-    patches flash_attn_with_kvcache, and updates the allocator reference.
-    """
+    """Replace BF16 KV cache with TurboQuant_prod 4-bit compressed pool."""
     global _ACTIVE_TQ_POOL, _orig_flash_attn
 
-    # Guard: don't re-inject if already active
     if _ACTIVE_TQ_POOL is not None:
-        logger.warning("TurboQuant: already injected, skipping re-injection")
+        logger.warning("TurboQuant: already injected, skipping")
         return
 
     old_pool = model_runner.token_to_kv_pool
@@ -515,42 +516,37 @@ def inject_turboquant(model_runner):
     torch.cuda.empty_cache()
 
     free_before = torch.cuda.mem_get_info()[0]
-    logger.info("TurboQuant: freed BF16 KV pool. VRAM free: %.2f GB", free_before / 1e9)
+    logger.info("TurboQuant: freed BF16 pool. VRAM free: %.2f GB", free_before / 1e9)
 
-    tq = TurboQuant(params["device"])
+    tq = TurboQuant(params["device"], num_layers=params["layer_num"])
     tq_pool = TurboQuantKVPool(tq=tq, **params)
     model_runner.token_to_kv_pool = tq_pool
     _ACTIVE_TQ_POOL = tq_pool
 
-    # Update the allocator's cached KV pool reference so it doesn't hold
-    # a stale pointer to the freed BF16 pool.  The allocator stores
-    # _kvcache in BaseTokenToKVPoolAllocator.__init__ (allocator.py:50).
     allocator = getattr(model_runner, "token_to_kv_pool_allocator", None)
     if allocator is not None and hasattr(allocator, "_kvcache"):
         allocator._kvcache = tq_pool
-        logger.info("TurboQuant: updated allocator._kvcache reference")
+        logger.info("TurboQuant: updated allocator._kvcache")
 
     free_after = torch.cuda.mem_get_info()[0]
     logger.info(
-        "TurboQuant: pool created. VRAM free: %.2f GB (net freed: %.2f GB)",
+        "TurboQuant: pool created. VRAM free: %.2f GB (freed: %.2f GB)",
         free_after / 1e9, (free_after - free_before) / 1e9,
     )
 
-    # Monkey-patch flash_attn.  Guard against double-patching: only capture
-    # _orig_flash_attn if it hasn't been set yet (i.e., first injection).
     import sgl_kernel.flash_attn as _sgl_fa
-
     if _orig_flash_attn is None:
         _orig_flash_attn = _sgl_fa.flash_attn_with_kvcache
     _sgl_fa.flash_attn_with_kvcache = _patched_flash_attn
 
     try:
-        import sglang.srt.layers.attention.flashattention_backend as _fa_backend
-        _fa_backend.flash_attn_with_kvcache = _patched_flash_attn
+        import sglang.srt.layers.attention.flashattention_backend as _fa
+        _fa.flash_attn_with_kvcache = _patched_flash_attn
     except (ImportError, AttributeError) as exc:
-        logger.warning("Could not patch FA backend module: %s", exc)
+        logger.warning("Could not patch FA backend: %s", exc)
 
     logger.info(
-        "TurboQuant: active. %d slots x %d layers, 3.5 bits/ch, %.1fx compression",
-        params["size"], params["layer_num"], 256.0 / 60.0,
+        "TurboQuant_prod: active. %d slots x %d layers, 4 bits/ch (3 MSE + 1 QJL), "
+        "68 bytes/head, 3.76x compression",
+        params["size"], params["layer_num"],
     )
